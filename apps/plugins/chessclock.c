@@ -417,6 +417,16 @@
 #define CHC_SETTINGS_OK     BUTTON_SELECT
 #define CHC_SETTINGS_CANCEL BUTTON_BACK
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define CHC_QUIT            BUTTON_HOME
+#define CHC_STARTSTOP       BUTTON_PLAY
+#define CHC_RESET           BUTTON_LEFT
+#define CHC_MENU            BUTTON_RIGHT
+#define CHC_SETTINGS_INC    BUTTON_UP
+#define CHC_SETTINGS_DEC    BUTTON_DOWN
+#define CHC_SETTINGS_OK     BUTTON_PLAY
+#define CHC_SETTINGS_CANCEL BUTTON_HOME
+
 #else
 #error No keymap defined!
 #endif

@@ -571,6 +571,19 @@
 #define IMGVIEW_MENU        BUTTON_MENU
 #define IMGVIEW_QUIT        BUTTON_BACK
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define IMGVIEW_ZOOM_PRE        BUTTON_PLAY
+#define IMGVIEW_ZOOM_IN         (BUTTON_PLAY|BUTTON_REL)
+#define IMGVIEW_ZOOM_OUT        (BUTTON_PLAY|BUTTON_REPEAT)
+#define IMGVIEW_UP              BUTTON_UP
+#define IMGVIEW_DOWN            BUTTON_DOWN
+#define IMGVIEW_LEFT            BUTTON_LEFT
+#define IMGVIEW_RIGHT           BUTTON_RIGHT
+#define IMGVIEW_NEXT            (BUTTON_PLAY|BUTTON_RIGHT)
+#define IMGVIEW_PREVIOUS        (BUTTON_PLAY|BUTTON_LEFT)
+#define IMGVIEW_MENU            BUTTON_HOME
+#define IMGVIEW_SLIDE_SHOW      (BUTTON_PLAY|BUTTON_DOWN)
+
 #else
 #error No keymap defined!
 #endif

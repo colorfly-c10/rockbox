@@ -24,14 +24,25 @@
 #define CS4398_VOLUME_MIN	-1270
 #define CS4398_VOLUME_MAX	0
 
+#ifdef COLORFLY_C10
+/* The C10 does not have an independently controlled unity-gain line output.
+ * Advertising LINEOUT_CAP makes sound.c set line-out to 0 dB immediately
+ * after every headphone-volume update, and both hooks address this same DAC. */
+#define AUDIOHW_CAPS FILTER_ROLL_OFF_CAP
+#else
 #define AUDIOHW_CAPS (FILTER_ROLL_OFF_CAP | LINEOUT_CAP)
+#endif
 AUDIOHW_SETTING(VOLUME, "dB", 0, 1, CS4398_VOLUME_MIN/10, CS4398_VOLUME_MAX/10, -25)
 AUDIOHW_SETTING(FILTER_ROLL_OFF, "", 0, 1, 0, 1, 0)
 
 void cs4398_write_reg(uint8_t reg, uint8_t val);
 uint8_t cs4398_read_reg(uint8_t reg);
 
-#define CS4398_I2C_ADDR		0x4f /* 1001111 */
+#ifdef COLORFLY_C10
+#define CS4398_I2C_ADDR         0x4c
+#else
+#define CS4398_I2C_ADDR         0x4f
+#endif
 
 #define CS4398_REG_CHIPID       0x01
 #define CS4398_REG_MODECTL      0x02

@@ -27,6 +27,16 @@ extern void i2c_begin(void);
 extern void i2c_end(void);
 extern int i2c_write(int device, const unsigned char* buf, int count );
 extern int i2c_read(int device, unsigned char* buf, int count );
+#ifdef COLORFLY_C10
+extern void c10_i2c0_init(void);
+extern int c10_i2c0_write(int device, const unsigned char* buf, int count);
+extern int c10_i2c0_read_reg(int device, unsigned char reg,
+                             unsigned char* value);
+extern int c10_i2c1_read_reg(int device, unsigned char reg,
+                             unsigned char* value);
+extern int c10_i2c1_write_reg(int device, unsigned char reg,
+                              unsigned char value);
+#endif
 extern int i2c_readmem(int device, int address, unsigned char* buf, int count );
 extern int i2c_writemem(int device, int address, const unsigned char* buf, int count );
 extern void i2c_outb(unsigned char byte);

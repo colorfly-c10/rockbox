@@ -28,13 +28,23 @@
 void cs4398_write_reg(uint8_t reg, uint8_t val)
 {
     unsigned char buf[2] = {reg, val};
+#ifdef COLORFLY_C10
+    c10_i2c0_write(CS4398_I2C_ADDR, buf, 2);
+#else
     i2c_write(CS4398_I2C_ADDR, (unsigned char *)&buf, 2);
+#endif
 }
 
 uint8_t cs4398_read_reg(uint8_t reg)
 {
+#ifdef COLORFLY_C10
+    unsigned char value = 0xff;
+    c10_i2c0_read_reg(CS4398_I2C_ADDR, reg, &value);
+    return value;
+#else
     unsigned char buf[2] = {reg, 0xff};
     i2c_write(CS4398_I2C_ADDR, (unsigned char *)&buf[0], 1);
     i2c_read(CS4398_I2C_ADDR, (unsigned char *)&buf[1], 1);
     return buf[1];
+#endif
 }

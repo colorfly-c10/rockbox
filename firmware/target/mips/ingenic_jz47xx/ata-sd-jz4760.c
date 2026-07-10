@@ -25,6 +25,7 @@
 #include "dma-target.h"
 #include "led.h"
 #include "sdmmc.h"
+#include "disk.h"
 #include "logf.h"
 #include "storage.h"
 #include "string.h"
@@ -32,8 +33,22 @@
 
 #define SD_INTERRUPT 0   // COMPLETELY BROKEN!
 #define SD_DMA_ENABLE 1
+#ifdef COLORFLY_C10
+/* Poll MSC DMA completion. The legacy interrupt path shares one semaphore
+ * with command/data-done events, allowing an early event to satisfy the
+ * wrong wait during sustained playback. */
+#define SD_DMA_INTERRUPT 0
+#else
 #define SD_DMA_INTERRUPT 1  // HANGS RANDOMLY!
+#endif
+#ifdef COLORFLY_C10
+/* Stock enables MSC low-power mode and writes only START_OP for each command.
+ * The controller then starts and stops the card clock around the operation;
+ * explicitly combining CLOCK_START with START_OP is not the C10 sequence. */
 #define SD_AUTO_CLOCK 1
+#else
+#define SD_AUTO_CLOCK 1
+#endif
 
 #if NUM_DRIVES > 2
 #error "JZ4760 SD driver supports NUM_DRIVES <= 2 only"
@@ -64,7 +79,100 @@ static int                use_sbc[NUM_DRIVES];
 #define SD_SLOT_1  0       /* SD card 1 */
 #define SD_SLOT_2  1       /* SD card 2 */
 
+#ifdef COLORFLY_C10
+/* The C10 wires its removable microSD slot to MSC2 and internal eMMC to
+ * MSC0. Match Rockbox's normal convention: internal storage is drive 0 and
+ * removable storage is drive 1. */
+#define MSC_CHN(n) ((n) == SD_SLOT_1 ? 0 : 2)
+#else
 #define MSC_CHN(n) (2-n)
+#endif
+
+static unsigned int jz_sd_dma_request(const int drive, const bool write)
+{
+    switch (MSC_CHN(drive)) {
+    case 0:
+        return write ? DMAC_DRSR_RS_MSC0OUT : DMAC_DRSR_RS_MSC0IN;
+    case 1:
+        return write ? DMAC_DRSR_RS_MSC1OUT : DMAC_DRSR_RS_MSC1IN;
+    default:
+        return write ? DMAC_DRSR_RS_MSC2OUT : DMAC_DRSR_RS_MSC2IN;
+    }
+}
+
+#ifdef COLORFLY_C10
+/* The stock C10 kernel uses JZ4760 8-word descriptors for MSC DMA. Keep each
+ * descriptor on its own cache line: the DMA engine fetches it directly from
+ * SDRAM. The transfer unit is selected separately for every buffer. */
+struct c10_msc_dma_desc {
+    volatile unsigned int dcmd;
+    volatile unsigned int dsadr;
+    volatile unsigned int dtadr;
+    volatile unsigned int ddadr;
+    volatile unsigned int dstrd;
+    volatile unsigned int dreqt;
+    volatile unsigned int reserved0;
+    volatile unsigned int reserved1;
+};
+
+static struct c10_msc_dma_desc c10_rx_desc[NUM_DRIVES] CACHEALIGN_ATTR;
+static struct c10_msc_dma_desc c10_tx_desc[NUM_DRIVES] CACHEALIGN_ATTR;
+static unsigned char c10_emmc_ext_csd[SD_BLOCK_SIZE] CACHEALIGN_ATTR;
+static unsigned char c10_emmc_mbr[SD_BLOCK_SIZE] CACHEALIGN_ATTR;
+static sector_t c10_emmc_part4_start;
+static sector_t c10_emmc_part4_end;
+
+/* jz4760b.h was originally imported without the JZ4760B descriptor-invalid
+ * status bit. It is present in both Ingenic headers and the C10 stock kernel. */
+#define C10_DMAC_DCCSR_INV (1u << 6)
+
+static unsigned int c10_msc_dma_geometry(const void *buffer,
+                                         unsigned int bytes,
+                                         unsigned int *count)
+{
+    const unsigned long address = (unsigned long)buffer;
+
+    /* The stock scatter-DMA builder uses 32-bit descriptors for an
+     * unaligned head/tail and larger units only where both the memory
+     * address and length have the required alignment. A 64-byte unit at a
+     * merely word-aligned Rockbox file buffer makes DMAC halt with AR. */
+    if (((address | bytes) & 63) == 0) {
+        *count = bytes >> 6;
+        return DMAC_DCMD_DS_64BYTE;
+    }
+    if (((address | bytes) & 31) == 0) {
+        *count = bytes >> 5;
+        return DMAC_DCMD_DS_32BYTE;
+    }
+    if (((address | bytes) & 15) == 0) {
+        *count = bytes >> 4;
+        return DMAC_DCMD_DS_16BYTE;
+    }
+
+    *count = bytes >> 2;
+    return DMAC_DCMD_DS_32BIT;
+}
+
+static void c10_msc_dma_stop(const int channel)
+{
+    const int controller = channel / HALF_DMA_NUM;
+    const unsigned int pending = 1u << (channel % HALF_DMA_NUM);
+
+    /* Match jz_mmc_stop_dma() from the stock kernel.  In particular, do not
+     * leave CT/HLT or a terminal-descriptor interrupt pending for the next
+     * command: the card can otherwise report UNDERRUN on the following R1. */
+    REG_DMAC_DCCSR(channel) = 0;
+    REG_DMAC_DCMD(channel) = 0;
+    REG_DMAC_DSAR(channel) = 0;
+    REG_DMAC_DTAR(channel) = 0;
+    REG_DMAC_DTCR(channel) = 0;
+    REG_DMAC_DRSR(channel) = 0;
+    REG_DMAC_DDA(channel) = 0;
+    REG_DMAC_DMAIPR(controller) &= ~pending;
+    REG_DMAC_DMACR(controller) &= ~(DMAC_DMACR_HLT | DMAC_DMACR_AR);
+}
+
+#endif
 
 #define SD_IRQ_MASK(n)                \
 do {                                  \
@@ -103,8 +211,26 @@ enum sd_result_t
 
 /* Standard MMC/SD clock speeds */
 #define MMC_CLOCK_SLOW    400000      /* 400 kHz for initial setup */
+#ifdef COLORFLY_C10
+/* The stock C10 supplies MSC2 from a 24 MHz parent, so normal and
+ * high-speed operation both top out at 24 MHz on this board. */
+#define SD_CLOCK_FAST   24000000
+#define SD_CLOCK_HIGH   24000000
+#else
 #define SD_CLOCK_FAST   24000000      /* 24 MHz for SD Cards */
 #define SD_CLOCK_HIGH   48000000      /* 48 MHz for SD Cards */
+#endif
+
+#ifdef COLORFLY_C10
+/* Stock C10 eMMC initialization values, also used by the validated RetroFW
+ * MSC0 implementation. The device remains in legacy 4-bit SDR mode. */
+#define C10_MMC_SEND_OP_COND          1
+#define C10_MMC_SEND_EXT_CSD          8
+#define C10_MMC_OCR_ARG               0x40ff8000
+#define C10_MMC_RCA                   (1u << 16)
+#define C10_MMC_SWITCH_BUS_WIDTH_ARG  0x03b70101
+#define C10_MMC_EXT_CSD_SEC_COUNT     212
+#endif
 
 /* Proprietary commands, illegal/reserved according to SD Specification 2.00 */
     /* class 1 */
@@ -254,7 +380,7 @@ static inline int jz_sd_stop_clock(const int drive)
 
     //DEBUG("stop MMC clock");
 #if SD_AUTO_CLOCK
-    REG_MSC_LPM(drive) = 0; /* disable auto clock stop */
+    REG_MSC_LPM(MSC_CHN(drive)) = 0; /* disable auto clock stop */
 #endif
 
     /* only stop if necessary */
@@ -294,7 +420,9 @@ static int jz_sd_check_status(const int drive, struct sd_request *request)
     (void)request;
     unsigned int status = REG_MSC_STAT(MSC_CHN(drive));
 
-    /* Checking for response or data timeout */
+    /* A response timeout cannot safely enter Rockbox's synchronous data
+     * phase: unlike Linux, this driver has no asynchronous request state
+     * machine to unwind a command that never produced a usable response. */
     if (status & (MSC_STAT_TIME_OUT_RES | MSC_STAT_TIME_OUT_READ))
     {
         logf("%d SD timeout, MSC_STAT 0x%x CMD %d", drive, status,
@@ -307,6 +435,15 @@ static int jz_sd_check_status(const int drive, struct sd_request *request)
         (MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR |
          MSC_STAT_CRC_RES_ERR))
     {
+#ifdef COLORFLY_C10
+        /* JZ4760's MMC path can falsely report response CRC for CID/CSD.
+         * The working C10 RetroFW path ignores precisely these R2 errors;
+         * retain all data CRC and all other response CRC checks. */
+        if (drive == SD_SLOT_1 && request->rtype == RESPONSE_R2 &&
+            (status & (MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR |
+                       MSC_STAT_CRC_RES_ERR)) == MSC_STAT_CRC_RES_ERR)
+            return SD_NO_ERROR;
+#endif
         logf("SD CRC error, MSC_STAT 0x%x", status);
         return SD_ERROR_CRC;
     }
@@ -378,7 +515,19 @@ static void jz_sd_get_response(const int drive, struct sd_request *request)
 }
 
 #if SD_DMA_ENABLE
+static bool jz_sd_use_dma(const struct sd_request *req)
+{
+#ifdef COLORFLY_C10
+    return ((unsigned long)req->buffer & 0x3) == 0 && req->cnt >= 512 &&
+           (req->cnt & 63) == 0;
+#else
+    return ((unsigned long)req->buffer & 0x3) == 0 && req->cnt >= 512;
+#endif
+}
+
 static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req);
+static void jz_sd_receive_data_dma_start(const int drive,
+                                         struct sd_request *req);
 static int jz_sd_receive_data_dma(const int drive, struct sd_request *req);
 #endif
 
@@ -393,7 +542,11 @@ static int jz_sd_receive_data(const int drive, struct sd_request *req)
 
 #if SD_DMA_ENABLE
     /* Use DMA if we can */
-    if ((int)req->buffer & 0x3 == 0 && req->cnt >= 512)
+    /* Parenthesize the alignment test: equality has higher precedence than
+     * bitwise AND, so `ptr & 3 == 0` is always false and silently disables
+     * DMA. This matters on the C10 because PIO cannot reliably service MSC2
+     * while high-rate AIC DMA interrupts are active. */
+    if (jz_sd_use_dma(req))
         return jz_sd_receive_data_dma(drive, req);
 #endif
 
@@ -456,7 +609,7 @@ static int jz_sd_transmit_data(const int drive, struct sd_request *req)
 
 #if SD_DMA_ENABLE
     /* Use DMA if we can */
-    if ((int)req->buffer & 0x3 == 0 && req->cnt >= 512)
+    if (jz_sd_use_dma(req))
         return jz_sd_transmit_data_dma(drive, req);
 #endif
 
@@ -508,17 +661,52 @@ static int jz_sd_transmit_data(const int drive, struct sd_request *req)
 }
 
 #if SD_DMA_ENABLE
-static int jz_sd_receive_data_dma(const int drive, struct sd_request *req)
+static void jz_sd_receive_data_dma_start(const int drive,
+                                         struct sd_request *req)
 {
-    /* flush dcache */
+    /* Stock arms read DMA before starting the MSC command. This also keeps
+     * the FIFO from filling while the destination cache is invalidated. */
     discard_dcache_range(req->buffer, req->cnt);
 
     /* setup dma channel */
+#ifdef COLORFLY_C10
+    c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+    struct c10_msc_dma_desc *desc = &c10_rx_desc[drive];
+    unsigned int count;
+    unsigned int geometry = c10_msc_dma_geometry(req->buffer, req->cnt,
+                                                  &count);
+
+    /* Use one unlinked 8-word descriptor. DMAC0 remains masked at INTC;
+     * Rockbox polls TT and acknowledges the terminal interrupt pending bit. */
+    desc->dcmd = DMAC_DCMD_DAI | DMAC_DCMD_SWDH_32 |
+                 DMAC_DCMD_DWDH_32 | geometry | DMAC_DCMD_TIE;
+    desc->dsadr = PHYSADDR(MSC_RXFIFO(MSC_CHN(drive)));
+    desc->dtadr = PHYSADDR((unsigned long)req->buffer);
+    desc->ddadr = count;
+    desc->dstrd = 0;
+    desc->dreqt = jz_sd_dma_request(drive, false);
+    desc->reserved0 = 0;
+    desc->reserved1 = 0;
+    commit_discard_dcache_range(desc, sizeof(*desc));
+
+    REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = DMAC_DCCSR_DES8;
+    REG_DMAC_DRSR(DMA_SD_RX_CHANNEL(drive)) = desc->dreqt;
+    REG_DMAC_DDA(DMA_SD_RX_CHANNEL(drive)) = PHYSADDR((unsigned long)desc);
+    REG_DMAC_DMADBSR(DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM) =
+        1u << (DMA_SD_RX_CHANNEL(drive) % HALF_DMA_NUM);
+    REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM) |=
+        DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) |= DMAC_DCCSR_EN;
+#else
     REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
     REG_DMAC_DSAR(DMA_SD_RX_CHANNEL(drive)) = PHYSADDR(MSC_RXFIFO(MSC_CHN(drive))); /* DMA source addr */
     REG_DMAC_DTAR(DMA_SD_RX_CHANNEL(drive)) = PHYSADDR((unsigned long)req->buffer); /* DMA dest addr */
-    REG_DMAC_DTCR(DMA_SD_RX_CHANNEL(drive)) = (req->cnt + 3) >> 2;                  /* DMA transfer count */
-    REG_DMAC_DRSR(DMA_SD_RX_CHANNEL(drive)) = (drive == SD_SLOT_1) ? DMAC_DRSR_RS_MSC2IN : DMAC_DRSR_RS_MSC1IN;    /* DMA request type */
+    /* Direct/non-descriptor mode follows Ingenic's generic JZ4760 driver and
+     * counts 32-bit units. Stock uses 64-byte units only in its linked
+     * descriptor path; using that encoding directly left the C10 DMA idle. */
+    REG_DMAC_DTCR(DMA_SD_RX_CHANNEL(drive)) = (req->cnt + 3) >> 2;
+    REG_DMAC_DRSR(DMA_SD_RX_CHANNEL(drive)) =
+        jz_sd_dma_request(drive, false);
 
     REG_DMAC_DCMD(DMA_SD_RX_CHANNEL(drive)) =
 #if SD_DMA_INTERRUPT
@@ -527,17 +715,95 @@ static int jz_sd_receive_data_dma(const int drive, struct sd_request *req)
         DMAC_DCMD_DAI | DMAC_DCMD_SWDH_32 | DMAC_DCMD_DWDH_32 |
         DMAC_DCMD_DS_32BIT;
     REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = DMAC_DCCSR_EN | DMAC_DCCSR_NDES;
+#endif
+}
+
+static int jz_sd_receive_data_dma(const int drive, struct sd_request *req)
+{
 
     /* wait for dma completion */
 #if SD_DMA_INTERRUPT
     semaphore_wait(&sd_wakeup[drive], TIMEOUT_BLOCK);
 #else
-    while (REG_DMAC_DTCR(DMA_SD_RX_CHANNEL(drive)))
-           yield();
+    {
+        long deadline = current_tick + HZ * 5;
+        unsigned int state;
+        do {
+            state = REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive));
+#ifdef COLORFLY_C10
+            /* TT is authoritative even if a controller-wide sticky flag was
+             * left by another channel. Channel INV/AR/HLT are actual faults. */
+            if (state & DMAC_DCCSR_TT)
+                break;
+            if (state & (C10_DMAC_DCCSR_INV | DMAC_DCCSR_AR |
+                         DMAC_DCCSR_HLT)) {
+                c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+            unsigned int controller = DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM;
+            if ((state & DMAC_DCCSR_AR) ||
+                (REG_DMAC_DMACR(controller) &
+                 (DMAC_DMACR_AR | DMAC_DMACR_HLT))) {
+                REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+                return SD_ERROR_DRIVER_FAILURE;
+            }
+            unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+            if (stat & MSC_STAT_TIME_OUT_READ) {
+#ifdef COLORFLY_C10
+                c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+                REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+                return SD_ERROR_TIMEOUT;
+            }
+            if (stat & MSC_STAT_CRC_READ_ERROR) {
+#ifdef COLORFLY_C10
+                c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+                REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+                return SD_ERROR_CRC;
+            }
+#ifndef COLORFLY_C10
+            /* Direct mode is complete when the programmed count reaches
+             * zero. The C10 can report MSC DATA_TRAN_DONE without latching
+             * DCCSR.TT when this channel is polled with interrupts disabled. */
+            if (REG_DMAC_DTCR(DMA_SD_RX_CHANNEL(drive)) == 0)
+                break;
+#endif
+            yield();
+        } while (TIME_BEFORE(current_tick, deadline));
+
+#ifdef COLORFLY_C10
+        if (!(REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) & DMAC_DCCSR_TT)) {
+#else
+        if (REG_DMAC_DTCR(DMA_SD_RX_CHANNEL(drive)) != 0) {
+#endif
+#ifdef COLORFLY_C10
+            c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+            REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+            return SD_ERROR_TIMEOUT;
+        }
+    }
 #endif
 
     /* clear status and disable channel */
+#ifdef COLORFLY_C10
+    c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
     REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+
+    /* DMA completion only describes the memory transfer. The MSC can still
+     * report a card-side timeout or CRC failure, as the stock driver's data
+     * completion path does. */
+    unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+    if (stat & MSC_STAT_TIME_OUT_READ)
+        return SD_ERROR_TIMEOUT;
+    if (stat & MSC_STAT_CRC_READ_ERROR)
+        return SD_ERROR_CRC;
 
     /* flush dcache again */
     discard_dcache_range(req->buffer, req->cnt);
@@ -551,11 +817,39 @@ static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req)
     commit_discard_dcache_range(req->buffer, req->cnt);
 
     /* setup dma channel */
+#ifdef COLORFLY_C10
+    c10_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+    struct c10_msc_dma_desc *desc = &c10_tx_desc[drive];
+    unsigned int count;
+    unsigned int geometry = c10_msc_dma_geometry(req->buffer, req->cnt,
+                                                  &count);
+
+    desc->dcmd = DMAC_DCMD_SAI | DMAC_DCMD_SWDH_32 |
+                 DMAC_DCMD_DWDH_32 | geometry | DMAC_DCMD_TIE;
+    desc->dsadr = PHYSADDR((unsigned long)req->buffer);
+    desc->dtadr = PHYSADDR(MSC_TXFIFO(MSC_CHN(drive)));
+    desc->ddadr = count;
+    desc->dstrd = 0;
+    desc->dreqt = jz_sd_dma_request(drive, true);
+    desc->reserved0 = 0;
+    desc->reserved1 = 0;
+    commit_discard_dcache_range(desc, sizeof(*desc));
+
+    REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = DMAC_DCCSR_DES8;
+    REG_DMAC_DRSR(DMA_SD_TX_CHANNEL(drive)) = desc->dreqt;
+    REG_DMAC_DDA(DMA_SD_TX_CHANNEL(drive)) = PHYSADDR((unsigned long)desc);
+    REG_DMAC_DMADBSR(DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM) =
+        1u << (DMA_SD_TX_CHANNEL(drive) % HALF_DMA_NUM);
+    REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM) |=
+        DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) |= DMAC_DCCSR_EN;
+#else
     REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = 0;
     REG_DMAC_DSAR(DMA_SD_TX_CHANNEL(drive)) = PHYSADDR((unsigned long) req->buffer); /* DMA source addr */
     REG_DMAC_DTAR(DMA_SD_TX_CHANNEL(drive)) = PHYSADDR(MSC_TXFIFO(MSC_CHN(drive)));  /* DMA dest addr */
-    REG_DMAC_DTCR(DMA_SD_TX_CHANNEL(drive)) = (req->cnt + 3) >> 2;                       /* DMA transfer count */
-    REG_DMAC_DRSR(DMA_SD_TX_CHANNEL(drive)) = (drive == SD_SLOT_1) ? DMAC_DRSR_RS_MSC2OUT : DMAC_DRSR_RS_MSC1OUT;    /* DMA request type */
+    REG_DMAC_DTCR(DMA_SD_TX_CHANNEL(drive)) = (req->cnt + 3) >> 2;
+    REG_DMAC_DRSR(DMA_SD_TX_CHANNEL(drive)) =
+        jz_sd_dma_request(drive, true);
 
     REG_DMAC_DCMD(DMA_SD_TX_CHANNEL(drive)) =
 #if SD_DMA_INTERRUPT
@@ -564,17 +858,67 @@ static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req)
         DMAC_DCMD_SAI | DMAC_DCMD_SWDH_32 | DMAC_DCMD_DWDH_32 |
         DMAC_DCMD_DS_32BIT;
     REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = DMAC_DCCSR_EN | DMAC_DCCSR_NDES;
+#endif
 
     /* wait for dma completion */
 #if SD_DMA_INTERRUPT
     semaphore_wait(&sd_wakeup[drive], TIMEOUT_BLOCK);
 #else
-    while (REG_DMAC_DTCR(DMA_SD_TX_CHANNEL(drive)))
-           yield();
+    {
+        long deadline = current_tick + HZ * 5;
+        unsigned int state;
+        do {
+            state = REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive));
+#ifdef COLORFLY_C10
+            if (state & DMAC_DCCSR_TT)
+                break;
+            if (state & (C10_DMAC_DCCSR_INV | DMAC_DCCSR_AR |
+                         DMAC_DCCSR_HLT)) {
+                c10_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+#else
+            unsigned int controller = DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM;
+            if ((state & DMAC_DCCSR_AR) ||
+                (REG_DMAC_DMACR(controller) &
+                 (DMAC_DMACR_AR | DMAC_DMACR_HLT))) {
+                REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = 0;
+#endif
+                return SD_ERROR_DRIVER_FAILURE;
+            }
+#ifndef COLORFLY_C10
+            if (REG_DMAC_DTCR(DMA_SD_TX_CHANNEL(drive)) == 0)
+                break;
+#endif
+            yield();
+        } while (TIME_BEFORE(current_tick, deadline));
+
+#ifdef COLORFLY_C10
+        if (!(REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) & DMAC_DCCSR_TT)) {
+#else
+        if (REG_DMAC_DTCR(DMA_SD_TX_CHANNEL(drive)) != 0) {
+#endif
+#ifdef COLORFLY_C10
+            c10_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+#else
+            REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = 0;
+#endif
+            return SD_ERROR_TIMEOUT;
+        }
+    }
 #endif
 
     /* clear status and disable channel */
+#ifdef COLORFLY_C10
+    c10_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+#else
     REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = 0;
+#endif
+
+    unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+    if (stat & MSC_STAT_TIME_OUT_READ)
+        return SD_ERROR_TIMEOUT;
+    if (stat & (MSC_STAT_CRC_WRITE_ERROR |
+                MSC_STAT_CRC_WRITE_ERROR_NOSTS))
+        return SD_ERROR_CRC;
 
     return SD_NO_ERROR;
 }
@@ -677,7 +1021,11 @@ void DMA_CALLBACK(DMA_SD_TX_CHANNEL1)(void)
 static inline unsigned int jz_sd_calc_clkrt(const int drive, unsigned int rate)
 {
     unsigned int clkrt = 0;
-    unsigned int clk_src = cpu_frequency / __cpm_get_mscdiv(); /* MSC_CLK */
+    /* MSCCDR encodes divisor-minus-one.  Using the raw field made C10's
+     * 48 MHz MSC source look like 72 MHz, producing clkrt=8; CLKRT only has
+     * three rate bits, so that wrapped to 0 and clocked card init at full rate.
+     */
+    unsigned int clk_src = __cpm_get_mscclk();
 
     if (!card[drive].sd2plus && rate > SD_CLOCK_FAST)
         rate = SD_CLOCK_FAST;
@@ -709,12 +1057,22 @@ static void jz_sd_set_clock(const int drive, unsigned int rate)
 ********************************************************************************************************************/
 static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 {
+#ifdef COLORFLY_C10
+    /* The stock C10 kernel binary ORs 0x5000 into every CMDAT. These are the
+     * 16-word receive/transmit FIFO thresholds used by its MSC DMA path. */
+    unsigned int cmdat = MSC_CMDAT_RTRG_EQUALT_16 |
+                         MSC_CMDAT_TTRG_LESS_16;
+#else
     unsigned int cmdat = 0;
+#endif
     int retval;
 #if !SD_INTERRUPT
     long deadline = current_tick + (HZ * 5);
 #endif
     bool has_data = (request->buffer != NULL);
+#if SD_DMA_ENABLE
+    bool rx_dma_armed = false;
+#endif
 
     /* Indicate we have no result yet */
     request->result = SD_NO_RESPONSE;
@@ -727,10 +1085,10 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
     /* Generic handling for all requests with data rx/tx */
     if (has_data) {
         cmdat |= MSC_CMDAT_DATA_EN;
-//            if (request->nob > 1 && use_sbc[drive])
-//                cmdat |= MSC_CMDAT_SEND_AS_STOP;
 #if SD_DMA_ENABLE
-        if (request->cnt >= 512)
+        /* Keep the controller's DMA mode in lockstep with the software path.
+         * An unaligned buffer falls back to PIO and must not set DMA_EN. */
+        if (jz_sd_use_dma(request))
             cmdat |= MSC_CMDAT_DMA_EN;
 #endif
     }
@@ -764,17 +1122,28 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
         case SD_SEND_SCR:
         case SD_READ_DAT_UNTIL_STOP:
         case SD_READ_SINGLE_BLOCK:
-        case SD_READ_MULTIPLE_BLOCK:
         case SD_SWITCH_FUNC:
             /* These READ data */
             break;
 
+        case SD_READ_MULTIPLE_BLOCK:
+#ifdef COLORFLY_C10
+            cmdat |= MSC_CMDAT_SEND_AS_STOP;
+#endif
+            break;
+
         case SD_WRITE_DAT_UNTIL_STOP:
         case SD_WRITE_BLOCK:
-        case SD_WRITE_MULTIPLE_BLOCK:
         case SD_PROGRAM_CID:
         case SD_PROGRAM_CSD:
                 /* These WRITE data */
+            cmdat |= MSC_CMDAT_WRITE;
+            break;
+
+        case SD_WRITE_MULTIPLE_BLOCK:
+#ifdef COLORFLY_C10
+            cmdat |= MSC_CMDAT_SEND_AS_STOP;
+#endif
             cmdat |= MSC_CMDAT_WRITE;
             break;
 
@@ -844,6 +1213,20 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
     DEBUG("%d Send cmd %d cmdat: %x arg: %x resp %d", drive, request->cmd,
           cmdat, request->arg, request->rtype);
 
+    /* Stock jz_mmc_execute_cmd reloads the response timeout for every
+     * command. A controller reset establishes the same value initially,
+     * but commands are allowed to update it. */
+    REG_MSC_RESTO(MSC_CHN(drive)) = 0xff;
+
+#if SD_DMA_ENABLE
+    /* The stock C10 driver arms read DMA before launching the command. Write
+     * DMA is armed after the response, when the MSC starts requesting data. */
+    if (has_data && !(cmdat & MSC_CMDAT_WRITE) && jz_sd_use_dma(request)) {
+        jz_sd_receive_data_dma_start(drive, request);
+        rx_dma_armed = true;
+    }
+#endif
+
     /* Start SD clock and send command to card */
     jz_sd_start_clock(drive);
 
@@ -851,21 +1234,45 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 #if SD_INTERRUPT
     semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
+#ifdef COLORFLY_C10
+    /* Stock waits on the controller status, including terminal error bits;
+     * IREG is an interrupt latch and is not its command-completion source. */
+    while (!(REG_MSC_STAT(MSC_CHN(drive)) &
+             (MSC_STAT_END_CMD_RES | MSC_STAT_TIME_OUT_RES |
+              MSC_STAT_CRC_RES_ERR)))
+#else
     while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_END_CMD_RES))
+#endif
     {
-        if (TIME_AFTER(current_tick, deadline))
+        if (TIME_AFTER(current_tick, deadline)) {
+#if SD_DMA_ENABLE
+            if (rx_dma_armed)
+#ifdef COLORFLY_C10
+                c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+                REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
+#endif
+#endif
             return SD_ERROR_TIMEOUT;
+        }
         yield();
     }
 #endif
 
     /* Check for status */
     retval = jz_sd_check_status(drive, request);
-#if SD_INTERRUPT
     REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_END_CMD_RES;    /* clear flag */
+    if (retval) {
+#if SD_DMA_ENABLE
+        if (rx_dma_armed)
+#ifdef COLORFLY_C10
+            c10_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#else
+            REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = 0;
 #endif
-    if (retval)
+#endif
         return retval;
+    }
 
     /* Complete command with no response */
     if (request->rtype == RESPONSE_NONE)
@@ -888,10 +1295,43 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
         semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
         /* Wait for Data Done */
-        while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_DATA_TRAN_DONE))
+        deadline = current_tick + (HZ * 5);
+#ifdef COLORFLY_C10
+        /* Stock's synchronous path verifies DATA_TRAN_DONE in STAT. IREG is
+         * only the latch cleared after the terminal controller state. */
+        while (!(REG_MSC_STAT(MSC_CHN(drive)) & MSC_STAT_DATA_TRAN_DONE)) {
+#else
+        while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_DATA_TRAN_DONE)) {
+#endif
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            if (TIME_AFTER(current_tick, deadline))
+                return SD_ERROR_TIMEOUT;
             yield();
+        }
         REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_DATA_TRAN_DONE;    /* clear status */
 #endif
+
+#ifdef COLORFLY_C10
+        if (cmdat & MSC_CMDAT_SEND_AS_STOP) {
+            deadline = current_tick + (HZ * 5);
+            while (!(REG_MSC_STAT(MSC_CHN(drive)) &
+                     (MSC_STAT_AUTO_CMD_DONE | MSC_STAT_TIME_OUT_READ |
+                      MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR))) {
+                if (TIME_AFTER(current_tick, deadline))
+                    return SD_ERROR_TIMEOUT;
+                yield();
+            }
+
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_AUTO_CMD_DONE;
+            REG_MSC_CMDAT(MSC_CHN(drive)) &= ~MSC_CMDAT_SEND_AS_STOP;
+        }
+#endif
+
     }
 
     /* Wait for Prog Done event if necessary */
@@ -900,8 +1340,15 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 #if SD_INTERRUPT
         semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
-        while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_PRG_DONE))
+        deadline = current_tick + (HZ * 5);
+        while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_PRG_DONE)) {
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            if (TIME_AFTER(current_tick, deadline))
+                return SD_ERROR_TIMEOUT;
             yield();
+        }
         REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_PRG_DONE;    /* clear status */
 #endif
     }
@@ -920,10 +1367,12 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 ** Input:     NULL
 ** Output:    1: insert entirely    0: not insert entirely
 ********************************************************************************************************************/
+#if !defined(COLORFLY_C10) || defined(HAVE_HOTSWAP)
 static int jz_sd_chkcard(const int drive)
 {
     return (__gpio_get_pin((drive == SD_SLOT_1) ? PIN_SD1_CD : PIN_SD2_CD) == 0 ? 1 : 0);
 }
+#endif
 
 /* MSC interrupt handlers */
 #if SD_INTERRUPT
@@ -967,6 +1416,13 @@ void MSC1(void) /* SD_SLOT_2 */
 #ifdef HAVE_HOTSWAP
 static void sd_gpio_setup_irq(const int drive, bool inserted)
 {
+#ifdef COLORFLY_C10
+    /* Only drive 1 is removable. Stock uses active-low PB20 and switches
+     * between rising-edge removal and falling-edge insertion interrupts. */
+    if (drive != SD_SLOT_2)
+        return;
+#endif
+
     int pin = (drive == SD_SLOT_1) ? PIN_SD1_CD : PIN_SD2_CD;
     int irq = (drive == SD_SLOT_1) ? IRQ_SD1_CD : IRQ_SD2_CD;
     if(inserted)
@@ -985,18 +1441,40 @@ static void sd_gpio_setup_irq(const int drive, bool inserted)
 ********************************************************************************************************************/
 static void jz_sd_hardware_init(const int drive)
 {
-    if (drive == SD_SLOT_1)
-        __cpm_start_msc2();   /* enable mmc2 clock */
-    else
-        __cpm_start_msc1();   /* enable mmc1 clock */
+    const int channel = MSC_CHN(drive);
+
+#ifdef COLORFLY_C10
+    /* C10 stock Linux/U-Boot use a 24 MHz MSC parent clock. The standard
+     * helper programs MSCCDR's divisor-minus-one field correctly. */
+    __cpm_select_msc_clk(1);
+#endif
+
+    switch (channel) {
+    case 0:
+        __cpm_start_msc0();
+        break;
+    case 1:
+        __cpm_start_msc1();
+        break;
+    default:
+        __cpm_start_msc2();
+        break;
+    }
 #ifdef HAVE_HOTSWAP
     sd_gpio_setup_irq(drive, jz_sd_chkcard(drive));
 #endif
-    __msc_reset(MSC_CHN(drive));  /* reset mmc/sd controller */
-    SD_IRQ_MASK(MSC_CHN(drive));  /* mask all IRQs */
+    __msc_reset(channel);  /* reset mmc/sd controller */
+
+    /* Match stock jz_mmc_reset(): reset leaves these controller defaults
+     * unspecified, and its request engine assumes the following values. */
+    REG_MSC_LPM(channel) = MSC_SET_LPM;
+    SD_IRQ_MASK(channel);
+    REG_MSC_RDTO(channel) = 0xffffffff;
+    REG_MSC_RESTO(channel) = 0xff;
 #if SD_AUTO_CLOCK
-    REG_MSC_STRPCL(MSC_CHN(drive)) = MSC_STRPCL_CLOCK_CONTROL_START; /* Enable clocks */
-    REG_MSC_LPM(drive) = MSC_SET_LPM; /* enable auto clock stop */
+#ifndef COLORFLY_C10
+    REG_MSC_STRPCL(channel) = MSC_STRPCL_CLOCK_CONTROL_START; /* Enable clocks */
+#endif
 #else
     jz_sd_stop_clock(drive); /* stop SD clock */
 #endif
@@ -1022,6 +1500,7 @@ static void sd_send_cmd(const int drive, struct sd_request *request, int cmd, un
     retval = jz_sd_exec_cmd(drive, request);
     if (retval)
         request->result = retval;
+
 }
 
 static void sd_simple_cmd(const int drive, struct sd_request *request, int cmd, unsigned int arg,
@@ -1030,9 +1509,138 @@ static void sd_simple_cmd(const int drive, struct sd_request *request, int cmd, 
     sd_send_cmd(drive, request, cmd, arg, 0, 0, rtype, NULL);
 }
 
+#ifdef COLORFLY_C10
+static int c10_mmc_init_card(const int drive)
+{
+    struct sd_request request = {0};
+    struct sd_response_r1 r1;
+    struct sd_response_r3 r3;
+    long deadline;
+    int retval;
+
+    sd_simple_cmd(drive, &request, SD_GO_IDLE_STATE, 0, RESPONSE_NONE);
+
+    deadline = current_tick + HZ;
+    do {
+        sd_simple_cmd(drive, &request, C10_MMC_SEND_OP_COND,
+                      C10_MMC_OCR_ARG, RESPONSE_R3);
+        retval = sd_unpack_r3(&request, &r3);
+        if (retval)
+            return retval;
+
+        card[drive].ocr = r3.ocr;
+        if (r3.ocr & SD_CARD_BUSY)
+            break;
+
+        sleep(HZ / 100);
+    } while (TIME_BEFORE(current_tick, deadline));
+
+    if (!(card[drive].ocr & SD_CARD_BUSY))
+        return SD_ERROR_TIMEOUT;
+
+    sd_simple_cmd(drive, &request, SD_ALL_SEND_CID, 0, RESPONSE_R2);
+    if (request.result)
+        return request.result;
+    for (int i = 0; i < 4; i++)
+        card[drive].cid[i] = PARSE_U32(request.response, 1 + i * 4);
+
+    card[drive].rca = C10_MMC_RCA;
+    sd_simple_cmd(drive, &request, SD_SEND_RELATIVE_ADDR,
+                  card[drive].rca, RESPONSE_R1);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    sd_simple_cmd(drive, &request, SD_SEND_CSD,
+                  card[drive].rca, RESPONSE_R2);
+    if (request.result)
+        return request.result;
+    for (int i = 0; i < 4; i++)
+        card[drive].csd[i] = PARSE_U32(request.response, 1 + i * 4);
+
+    sd_simple_cmd(drive, &request, SD_SELECT_CARD,
+                  card[drive].rca, RESPONSE_R1B);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    /* MMC SWITCH: write EXT_CSD BUS_WIDTH=1, selecting four data lines.
+     * This exact argument is present in the stock-compatible C10 path. */
+    sd_simple_cmd(drive, &request, SD_SWITCH_FUNC,
+                  C10_MMC_SWITCH_BUS_WIDTH_ARG, RESPONSE_R1B);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+    use_4bit[drive] = 2;
+
+    memset(c10_emmc_ext_csd, 0, sizeof(c10_emmc_ext_csd));
+    sd_send_cmd(drive, &request, C10_MMC_SEND_EXT_CSD, 0, 1,
+                sizeof(c10_emmc_ext_csd), RESPONSE_R1,
+                c10_emmc_ext_csd);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    card[drive].numblocks =
+        (sector_t)c10_emmc_ext_csd[C10_MMC_EXT_CSD_SEC_COUNT] |
+        ((sector_t)c10_emmc_ext_csd[C10_MMC_EXT_CSD_SEC_COUNT + 1] << 8) |
+        ((sector_t)c10_emmc_ext_csd[C10_MMC_EXT_CSD_SEC_COUNT + 2] << 16) |
+        ((sector_t)c10_emmc_ext_csd[C10_MMC_EXT_CSD_SEC_COUNT + 3] << 24);
+    if (card[drive].numblocks == 0)
+        return SD_ERROR_DRIVER_FAILURE;
+
+    card[drive].blocksize = SD_BLOCK_SIZE;
+    /* The shared transfer path uses sd2plus to select sector addressing.
+     * EXT_CSD SEC_COUNT eMMC devices use the same 512-byte sector argument. */
+    card[drive].sd2plus = 1;
+    jz_sd_set_clock(drive, SD_CLOCK_FAST);
+
+    /* The first three eMMC partitions contain the stock boot chain and
+     * system. Validate the on-device MBR and remember the exact partition-4
+     * interval; every later eMMC write is rejected unless it stays wholly
+     * inside this FAT32 partition. */
+    c10_emmc_part4_start = 0;
+    c10_emmc_part4_end = 0;
+    memset(c10_emmc_mbr, 0, sizeof(c10_emmc_mbr));
+    sd_send_cmd(drive, &request, SD_READ_SINGLE_BLOCK, 0, 1,
+                sizeof(c10_emmc_mbr), RESPONSE_R1, c10_emmc_mbr);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    const unsigned int entry = 446 + 3 * 16;
+    const unsigned int type = c10_emmc_mbr[entry + 4];
+    const sector_t start =
+        (sector_t)c10_emmc_mbr[entry + 8] |
+        ((sector_t)c10_emmc_mbr[entry + 9] << 8) |
+        ((sector_t)c10_emmc_mbr[entry + 10] << 16) |
+        ((sector_t)c10_emmc_mbr[entry + 11] << 24);
+    const sector_t size =
+        (sector_t)c10_emmc_mbr[entry + 12] |
+        ((sector_t)c10_emmc_mbr[entry + 13] << 8) |
+        ((sector_t)c10_emmc_mbr[entry + 14] << 16) |
+        ((sector_t)c10_emmc_mbr[entry + 15] << 24);
+
+    if (c10_emmc_mbr[510] != 0x55 || c10_emmc_mbr[511] != 0xaa ||
+        (type != PARTITION_TYPE_FAT32 &&
+         type != PARTITION_TYPE_FAT32_LBA) ||
+        start == 0 || size == 0 || start >= card[drive].numblocks ||
+        size > card[drive].numblocks - start)
+        return SD_ERROR_DRIVER_FAILURE;
+
+    c10_emmc_part4_start = start;
+    c10_emmc_part4_end = start + size;
+    card[drive].initialized = 1;
+
+    logf("eMMC ready: %lu sectors",
+         (unsigned long)card[drive].numblocks);
+    return SD_NO_ERROR;
+}
+#endif
+
 static int sd_exec_acmd(const int drive, struct sd_request *request, int cmd, unsigned int arg)
 {
-    struct sd_response_r1 r1;
+    struct sd_response_r1 r1 = {0};
     int retval;
 
     sd_simple_cmd(drive, request, SD_APP_CMD, card[drive].rca, RESPONSE_R1);
@@ -1236,7 +1844,7 @@ static int sd_switch_hs(const int drive, struct sd_request *request)
 
 static int sd_select_card(const int drive)
 {
-    struct sd_request request;
+    struct sd_request request = {0};
     struct sd_response_r1 r1;
     int retval;
 
@@ -1256,7 +1864,7 @@ static int sd_select_card(const int drive)
         }
     }
 
-    bool sup_4bit = 1; //  XXX check against SCR
+    bool sup_4bit = true; // XXX check against SCR
 
     if (sup_4bit) {
         retval = sd_exec_acmd(drive, &request, SD_SET_BUS_WIDTH, 2);
@@ -1276,7 +1884,13 @@ static int sd_select_card(const int drive)
 
 static inline bool card_detect_target(const int drive)
 {
+#ifdef COLORFLY_C10
+    /* eMMC is soldered down; stock Linux confirms PB20 is active-low card
+     * detect for the removable MSC2 microSD slot. */
+    return drive == SD_SLOT_1 || jz_sd_chkcard(drive);
+#else
     return (jz_sd_chkcard(drive) == 1);
+#endif
 }
 
 static int __sd_init_device(const int drive)
@@ -1292,13 +1906,37 @@ static int __sd_init_device(const int drive)
     use_sbc[drive] = 0;
     active[drive] = 0;
 
+#ifdef COLORFLY_C10
+    if (drive == SD_SLOT_2) {
+        /* Reassert stock lepus_tf_power_on() for every retry, then leave the
+         * removable-card rail stable before issuing its first command. */
+        REG_GPIO_PXDATC(1) = (1u << 30);
+        sleep(HZ / 50);
+    }
+#endif
+
     /* reset mmc/sd controller */
     jz_sd_hardware_init(drive);
 
     /* Don't bother if card isn't present */
-    if (!card_detect_target(drive))
+    if (!card_detect_target(drive)) {
         return 0;
+    }
 
+#ifdef COLORFLY_C10
+    if (drive == SD_SLOT_1) {
+        retval = c10_mmc_init_card(drive);
+        __cpm_stop_msc0();
+        return retval;
+    }
+#endif
+
+    /* Stock JZ4760B U-Boot stops any inherited transfer before CMD0. */
+#ifdef COLORFLY_C10
+    sd_simple_cmd(drive, &init_req, SD_STOP_TRANSMISSION, 0, RESPONSE_R1B);
+#endif
+
+    /* CMD0 starts the card's protocol state machine. */
     sd_simple_cmd(drive, &init_req, SD_GO_IDLE_STATE, 0,     RESPONSE_NONE);
 
     sleep(HZ/2); /* Give the card/controller some rest */
@@ -1308,12 +1946,23 @@ static int __sd_init_device(const int drive)
        retval = sd_init_card_state(drive, &init_req);
     } while (TIME_BEFORE(current_tick, deadline) && (retval == SD_INIT_DOING));
 
-    retval = (retval == SD_INIT_PASSED ? sd_select_card(drive) : -1);
+    if (retval == SD_INIT_PASSED) {
+        retval = sd_select_card(drive);
+    } else {
+        retval = -1;
+    }
 
-    if (drive == SD_SLOT_1)
+    if (drive == SD_SLOT_1) {
+#ifdef COLORFLY_C10
+        __cpm_stop_msc0();
+#else
         __cpm_stop_msc2(); /* disable SD1 clock */
-    else
+#endif
+    } else {
+#ifndef COLORFLY_C10
         __cpm_stop_msc1(); /* disable SD2 clock */
+#endif
+    }
 
     return retval;
 }
@@ -1325,15 +1974,27 @@ int sd_init(void)
     sd_init_gpio();     /* init GPIO */
 
 #if SD_DMA_ENABLE
+#ifdef COLORFLY_C10
+    /* Plain JZ4760 DMACKE is a write command and reads back as zero. The
+     * stock C10 uses DMAC0 channel 2 for both MSC2 directions. Drive 0 uses
+     * channel 3 for MSC0, keeping both storage paths off AIC's controller. */
+    REG_DMAC_DMACKE(0) = (1u << DMA_SD_RX_CHANNEL(SD_SLOT_1)) |
+                         (1u << DMA_SD_RX_CHANNEL(SD_SLOT_2));
+#else
     __dmac_channel_enable_clk(DMA_SD_RX_CHANNEL(SD_SLOT_1));
     __dmac_channel_enable_clk(DMA_SD_RX_CHANNEL(SD_SLOT_2));
     __dmac_channel_enable_clk(DMA_SD_TX_CHANNEL(SD_SLOT_1));
     __dmac_channel_enable_clk(DMA_SD_TX_CHANNEL(SD_SLOT_2));
 #endif
+#endif
 
     if(!inited)
     {
+#ifdef COLORFLY_C10
+        __cpm_stop_msc1();   /* C10 uses MSC2 and MSC0 */
+#else
         __cpm_stop_msc0();   /* We don't use MSC0 */
+#endif
 
 #if SD_DMA_INTERRUPT || SD_INTERRUPT
         semaphore_init(&sd_wakeup[SD_SLOT_1], 1, 0);
@@ -1374,10 +2035,17 @@ tCardInfo* card_get_info_target(const int drive)
 static inline void sd_start_transfer(const int drive)
 {
     mutex_lock(&sd_mtx[drive]);
-    if (drive == SD_SLOT_1)
-        __cpm_start_msc2();
-    else
+    switch (MSC_CHN(drive)) {
+    case 0:
+        __cpm_start_msc0();
+        break;
+    case 1:
         __cpm_start_msc1();
+        break;
+    default:
+        __cpm_start_msc2();
+        break;
+    }
 
     active[drive] = 1;
     led(active[SD_SLOT_1] || active[SD_SLOT_2]);
@@ -1388,28 +2056,52 @@ static inline void sd_stop_transfer(const int drive)
     active[drive] = 0;
     led(active[SD_SLOT_1] || active[SD_SLOT_2]);
 
-    if (drive == SD_SLOT_1)
+    if (drive == SD_SLOT_1) {
+#ifdef COLORFLY_C10
+        __cpm_stop_msc0();
+#else
         __cpm_stop_msc2();
-    else
+#endif
+    } else {
+#ifndef COLORFLY_C10
         __cpm_stop_msc1();
+#endif
+    }
     mutex_unlock(&sd_mtx[drive]);
 }
 
 int sd_transfer_sectors(IF_MD(const int drive,) sector_t start, int count, void* buf, bool write)
 {
-    struct sd_request request;
+    struct sd_request request = {0};
     struct sd_response_r1 r1;
     int retval = -1;
 #ifndef HAVE_MULTIDRIVE
     const int drive = 0;
 #endif
 
+#ifdef COLORFLY_C10
+    /* Writes to internal storage must remain inside validated FAT32
+     * partition 4. This also protects the MBR and stock boot/system
+     * partitions when the raw eMMC drive is exported over USB. */
+    if (write && drive == SD_SLOT_1) {
+        if (count < 1 || c10_emmc_part4_start == 0 ||
+            start < c10_emmc_part4_start ||
+            start >= c10_emmc_part4_end ||
+            (sector_t)count > c10_emmc_part4_end - start)
+            return -1;
+    }
+#endif
+
     sd_start_transfer(drive);
 
-    if (!card_detect_target(drive) || count < 1 || (start + count) > card[drive].numblocks)
+    if (!card_detect_target(drive) || count < 1)
         goto err;
 
-    if(card[drive].initialized == 0 && !__sd_init_device(drive))
+    /* Retry card setup before using numblocks; a failed early init leaves it zero. */
+    if (card[drive].initialized == 0 && __sd_init_device(drive))
+        goto err;
+
+    if ((start + count) > card[drive].numblocks)
         goto err;
 
     sd_simple_cmd(drive, &request, SD_SEND_STATUS, card[drive].rca, RESPONSE_R1);
@@ -1444,10 +2136,21 @@ int sd_transfer_sectors(IF_MD(const int drive,) sector_t start, int count, void*
                 count, SD_BLOCK_SIZE, RESPONSE_R1, buf);
     retval = sd_unpack_r1(&request, &r1);
 
-    if (retval || (!use_sbc[drive] && count > 1)) {
+#ifdef COLORFLY_C10
+    /* Successful multiblock requests are terminated by the MSC controller's
+     * stop command. A failed transfer still falls back to an explicit CMD12
+     * below, exactly like the stock driver's error path. */
+    bool manual_stop = false;
+#else
+    bool manual_stop = !use_sbc[drive] && count > 1;
+#endif
+    if (retval || manual_stop) {
+        int transfer_retval = retval;
         sd_simple_cmd(drive, &request, SD_STOP_TRANSMISSION, 0, RESPONSE_R1B);
         retval = sd_unpack_r1(&request, &r1);
-        if (!write && retval == SD_ERROR_OUT_OF_RANGE)
+        if (transfer_retval)
+            retval = transfer_retval;
+        else if (!write && retval == SD_ERROR_OUT_OF_RANGE)
             retval = 0;
     }
 
@@ -1485,6 +2188,11 @@ void sd_enable(bool on)
 
 bool sd_disk_is_active(void)
 {
+    for (int drive = 0; drive < NUM_DRIVES; drive++) {
+        if (active[drive])
+            return true;
+    }
+
     return false;
 }
 
@@ -1496,10 +2204,14 @@ int sd_soft_reset(void)
 #ifdef HAVE_HOTSWAP
 bool sd_removable(IF_MD_NONVOID(const int drive))
 {
+#ifdef COLORFLY_C10
+    return drive == SD_SLOT_2;
+#else
 #ifdef HAVE_MULTIDRIVE
-     (void)drive;
+    (void)drive;
 #endif
     return true;
+#endif
 }
 
 static int sd_oneshot_callback(struct timeout *tmo)

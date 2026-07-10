@@ -44,7 +44,11 @@ void sd_get_info(IF_MD(int drive,) struct storage_info *info)
     info->num_sectors=card->numblocks;
     info->vendor="Rockbox";
 #if CONFIG_STORAGE == STORAGE_SD
+#ifdef COLORFLY_C10
+    info->product = (drive == 0) ? "Internal eMMC" : "microSD";
+#else
     info->product = (drive==0) ? "Internal Storage" : "SD Card Slot";
+#endif
 #else   /* Internal storage is not SD */
     info->product = "SD Card Slot";
 #endif

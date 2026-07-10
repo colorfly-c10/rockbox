@@ -133,6 +133,18 @@ static unsigned char mdma_irq_mask = 0;
 static unsigned char bdma_irq_mask = 0;
 static unsigned int gpio_irq_mask[6] = {0};
 
+static int get_dmac_irq(unsigned int controller)
+{
+    unsigned int pending = REG_DMAC_DMAIPR(controller) & 0x3f;
+    unsigned int first = controller * HALF_DMA_NUM;
+
+    for (unsigned int local = 0; local < HALF_DMA_NUM; ++local)
+        if (pending & (1u << local))
+            return first + local;
+
+    return -1;
+}
+
 void system_enable_irq(unsigned int irq)
 {
     register unsigned int t;
@@ -246,10 +258,17 @@ static int get_irq_number(void)
     if (UNLIKELY(irq0 < 0) && UNLIKELY(irq1 < 0))
         return -1;
 
-    // Prioritze DMA0 (audio) and TCU0 (systick), then everything on ipl1 (ie MSC mostly)
-    if (ipl0 & 1<<IRQ_DMAC0) {
-        irq = IRQ_DMAC0;
-        ipl0 &= ~(1<<IRQ_DMAC0);
+    /* Keep the DMA controller carrying playback ahead of the tick and
+     * storage interrupts.  C10 follows stock and uses DMAC1 channel 0 for
+     * AIC TX; the older JZ targets in this file use DMAC0 channel 0. */
+#ifdef COLORFLY_C10
+    const int audio_dma_irq = IRQ_DMAC1;
+#else
+    const int audio_dma_irq = IRQ_DMAC0;
+#endif
+    if (ipl0 & 1<<audio_dma_irq) {
+        irq = audio_dma_irq;
+        ipl0 &= ~(1<<audio_dma_irq);
     } else if (ipl0 & 1<<IRQ_TCU0) {
         irq = IRQ_TCU0;
         ipl0 &= ~(1<<IRQ_TCU0);
@@ -272,8 +291,14 @@ static int get_irq_number(void)
             irq = __gpio_get_irq() + IRQ_GPIO_0;
             break;
         case IRQ_DMAC0:
+            irq = get_dmac_irq(0);
+            if (irq >= 0)
+                irq += IRQ_DMA_0;
+            break;
         case IRQ_DMAC1:
-            irq = __dmac_get_irq() + IRQ_DMA_0;
+            irq = get_dmac_irq(1);
+            if (irq >= 0)
+                irq += IRQ_DMA_0;
             break;
         case IRQ_MDMA:
             irq = __mdmac_get_irq() + IRQ_MDMA_0;
@@ -570,6 +595,20 @@ static int serial_preinit(void)
 
 static void usb_preinit(void)
 {
+#ifdef COLORFLY_C10
+    /* START2 enters directly from the USB BootROM with MUSB still connected.
+     * Quiesce it before changing its clock or resetting the PHY. */
+    REG_USB_POWER &= ~USB_POWER_SOFTCONN;
+    REG_USB_INTRINE = 0;
+    REG_USB_INTROUTE = 0;
+    REG_USB_INTRUSBE = 0;
+    REG_USB_CNTL(USB_INTR_DMA_BULKIN) = 0;
+    REG_USB_CNTL(USB_INTR_DMA_BULKOUT) = 0;
+    /* START2 inherits BootROM's active MUSB session. Stock musb_start()
+     * clears SESSION before entering its fixed peripheral role. */
+    REG_USB_DEVCTL = 0;
+#endif
+
     /* Clear ECS bit of CPCCR, 0:clock source is EXCLK, 1:clock source is EXCLK/2 */
     REG_CPM_CPCCR &= ~CPCCR_ECS;
 
@@ -579,7 +618,12 @@ static void usb_preinit(void)
     /* Set CE bit of CPCCR, it means frequence is changed immediately */
     REG_CPM_CPCCR |= CPCCR_CE;
 
+#ifdef COLORFLY_C10
+    /* Stock cpm_set_clock() is followed by a 100 us settling delay. */
+    udelay(100);
+#else
     udelay(3);
+#endif
 
     /* Clear OTG bit of CLKGR0, 0:device can be accessed */
     REG_CPM_CLKGR0 &= ~CLKGR0_OTG;
@@ -588,20 +632,35 @@ static void usb_preinit(void)
     REG_CPM_USBVBFIL = 0x80;
 
     /* rdt */
+#ifdef COLORFLY_C10
+    /* The stock C10 kernel programs 0x196 before enabling FILLOAD. This
+     * timer is derived from EXCLK, not from Rockbox's current CPU DVFS rate. */
+    REG_CPM_USBRDT = 0x196;
+#else
     REG_CPM_USBRDT = (600 * (CPUFREQ_DEFAULT / 1000000)) / 1000;
+#endif
 
     /* rdt - filload_en */
     REG_CPM_USBRDT |= (1 << 25);
 
     /* TXRISETUNE & TXVREFTUNE. */
+#ifdef COLORFLY_C10
+    /* A direct BootROM handoff does not provide the reset-state upper bits
+     * assumed by the vendor kernel. Use the complete value measured while
+     * the stock high-speed gadget was working. */
+    REG_CPM_USBPCR = 0x439921b5;
+#else
     REG_CPM_USBPCR &= ~0x3f;
     REG_CPM_USBPCR |= 0x35;
 
+    /* The extra tuning below is inherited from other JZ4760 targets. The
+     * stock C10 binary leaves the low six USBPCR tuning bits at 0x35. */
     /* enable tx pre-emphasis */
     REG_CPM_USBPCR |= 0x40;
 
     /* most DC leave of tx */
     REG_CPM_USBPCR |= 0xf;
+#endif
 
     /* Device Mode. */
     REG_CPM_USBPCR &= ~(1 << 31);
@@ -627,11 +686,19 @@ static void dma_preinit(void)
 
     REG_MDMAC_DMACKES = 0x1;
 
+#ifdef COLORFLY_C10
+    /* Stock C10 captures show DMAC0=FMSC|DMAE and DMAC1=DMAE during audio.
+     * In particular, FAIC is not used for the reserved AIC channel 6 path;
+     * enabling it makes the DMA run ahead of the external audio clock. */
+    REG_DMAC_DMACR(0) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    REG_DMAC_DMACR(1) = DMAC_DMACR_DMAE;
+#else
     REG_DMAC_DMACR(DMA_AIC_TX_CHANNEL) = DMAC_DMACR_DMAE | DMAC_DMACR_FAIC;
     REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(0)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
     REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(1)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
     REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(0)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
     REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(1)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+#endif
 }
 
 /* Gets called *before* main */
@@ -668,7 +735,22 @@ void ICODE_ATTR system_early_init(void)
     REG_DDRC_CTRL = 0;
     REG_DDRC_CTRL = 0;
 
+#ifdef COLORFLY_C10
+    /*
+     * C10 START1 leaves mDDR in the stock 0x110 operating state. The writes
+     * above clear the controller FIFO but also remove PRET_8 and unaligned
+     * AXI support. Restore those persistent controls before LCD/MSC DMA uses
+     * SDRAM; the CKE state established during DDR initialization is retained.
+     */
+    REG_DDRC_CTRL = DDRC_CTRL_PRET_8 | DDRC_CTRL_UNALIGN;
+#endif
+
+#ifdef COLORFLY_C10
+    /* Preserve the 480 MHz PLL and known-good peripheral clock tree at boot. */
+    pll0_init(CPUFREQ_MAX);
+#else
     pll0_init(CPUFREQ_DEFAULT); // PLL0 drives everything but audio
+#endif
     pll1_disable();             // Leave PLL1 disabled until audio needs it
 
     /* Make sure UARTs are off */
@@ -709,6 +791,9 @@ void system_exception_wait(void)
 
 void power_off(void)
 {
+#ifdef COLORFLY_C10
+    c10_pmic_power_off();
+#else
     REG_CPM_RSR = 0x0;
 
     /* Set minimum wakeup_n pin low-level assertion time for wakeup: 100ms */
@@ -725,6 +810,7 @@ void power_off(void)
 
     /* Put CPU to hibernate mode */
     rtc_write_reg(RTC_HCR, HCR_PD);
+#endif
 
     while (1);
 }
@@ -749,7 +835,24 @@ void set_cpu_frequency(long frequency)
    else if (frequency > CPUFREQ_MAX)
        frequency = CPUFREQ_MAX;
 
+#ifdef COLORFLY_C10
+   /*
+    * Keep PLL0 and every peripheral/bus clock at their known-good rates.
+    * The generic PLL switch also rewrites the LCD, MSC, memory, and bus
+    * clocks; besides disrupting active devices, its 480 -> 192 MHz order
+    * briefly overclocks those buses. Keep CCLK an integer multiple of the
+    * fixed 120 MHz buses: C10 uses CDIV /1, /2, and /4 for its boost,
+    * normal, and idle states respectively.
+    */
+   unsigned int cdiv = frequency >= CPUFREQ_MAX ? 0 :
+                       frequency >= CPUFREQ_NORMAL ? 1 : 3;
+   REG_CPM_CPCCR = (REG_CPM_CPCCR & ~CPCCR_CDIV_MASK) |
+       (cdiv << CPCCR_CDIV_LSB) |
+       CPCCR_CE;
+   cpu_frequency = __cpm_get_cclk();
+#else
    pll0_init(frequency);
    cpu_frequency = __cpm_get_pllout2();
+#endif
 }
 #endif

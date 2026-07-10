@@ -343,6 +343,14 @@
 #define MIDI_VOL_DOWN   BUTTON_DOWN
 #define MIDI_PLAYPAUSE  BUTTON_USER
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define MIDI_QUIT       BUTTON_HOME
+#define MIDI_FFWD       BUTTON_RIGHT
+#define MIDI_REWIND     BUTTON_LEFT
+#define MIDI_VOL_UP     BUTTON_UP
+#define MIDI_VOL_DOWN   BUTTON_DOWN
+#define MIDI_PLAYPAUSE  BUTTON_PLAY
+
 #else
 #error No keymap defined!
 #endif

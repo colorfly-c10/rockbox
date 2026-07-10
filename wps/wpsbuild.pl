@@ -230,7 +230,11 @@ sub copywps
             system("cp $dir/$file $tempdir/wps/$theme.$ext");
             open(SKIN, "$dir/$file");
             while (<SKIN>) {
-                $filelist[$#filelist + 1] = $1 if (/[\(,]([^,]*?.bmp)[\),]/);
+                if (/[\(,]([^,]*?.bmp)[\),]/) {
+                    # Absolute paths intentionally share assets with another
+                    # installed skin and therefore need no local copy.
+                    $filelist[$#filelist + 1] = $1 unless ($1 =~ m{^/});
+                }
             }
             close(SKIN);
         }

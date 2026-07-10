@@ -392,6 +392,15 @@
 #define AST_RIGHT       BUTTON_RIGHT
 #define AST_FIRE        BUTTON_SELECT
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define AST_PAUSE       (BUTTON_HOME | BUTTON_REPEAT)
+#define AST_QUIT        (BUTTON_HOME | BUTTON_REL)
+#define AST_THRUST      BUTTON_UP
+#define AST_HYPERSPACE  BUTTON_DOWN
+#define AST_LEFT        BUTTON_LEFT
+#define AST_RIGHT       BUTTON_RIGHT
+#define AST_FIRE        BUTTON_PLAY
+
 #else
 #error No keymap defined!
 #endif

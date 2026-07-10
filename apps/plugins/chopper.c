@@ -212,6 +212,11 @@ CONFIG_KEYPAD == MROBE500_PAD
 #define ACTION2     BUTTON_MENU
 #define ACTIONTEXT  "A"
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define QUIT        BUTTON_HOME
+#define ACTION      BUTTON_PLAY
+#define ACTIONTEXT  "PLAY"
+
 #elif !defined(HAVE_TOUCHSCREEN)
 #error No keymap defined!
 #endif

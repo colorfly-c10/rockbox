@@ -328,8 +328,13 @@ static const int backlight_fade[] = {0,100,200,300,500,1000,2000,3000,5000,10000
 static const char graphic_numeric[] = "graphic,numeric";
 
 /* Default theme settings */
+#ifdef COLORFLY_C10
+#define DEFAULT_WPSNAME  "cabbiev2.400x360x16.scale125"
+#define DEFAULT_SBSNAME  "cabbiev2.400x360x16.scale125"
+#else
 #define DEFAULT_WPSNAME  "cabbiev2"
 #define DEFAULT_SBSNAME  "-"
+#endif
 #define DEFAULT_FMS_NAME "cabbiev2"
 
 #if LCD_HEIGHT <= 64
@@ -348,6 +353,10 @@ static const char graphic_numeric[] = "graphic,numeric";
   #define DEFAULT_FONT_HEIGHT 15
 #elif LCD_HEIGHT <= 320
   #define DEFAULT_FONT_HEIGHT 18
+#elif defined(COLORFLY_C10)
+  /* The 2.35-inch panel needs a larger UI than its pixel dimensions imply. */
+  #define DEFAULT_FONT_HEIGHT 21
+  #define DEFAULT_FONTNAME "21-Adobe-Helvetica"
 #elif defined(SHANLING_Q1)
   /* 16pt font looks pretty aliased & ugly */
   #define DEFAULT_FONT_HEIGHT 18
@@ -370,7 +379,11 @@ static const char graphic_numeric[] = "graphic,numeric";
 #endif
 
 #ifdef HAVE_LCD_COLOR
-  #if DEFAULT_FONT_HEIGHT >= 31 || defined(SHANLING_Q1)
+  #if defined(COLORFLY_C10)
+    /* Device-tested with the 21px default font on the 2.35-inch panel. */
+    #define DEFAULT_ICONSET "tango_icons.24x24"
+    #define DEFAULT_VIEWERS_ICONSET "tango_icons_viewers.24x24"
+  #elif DEFAULT_FONT_HEIGHT >= 31 || defined(SHANLING_Q1)
     #define DEFAULT_ICONSET "tango_icons.32x32"
     #define DEFAULT_VIEWERS_ICONSET "tango_icons_viewers.32x32"
   #elif DEFAULT_FONT_HEIGHT >= 23
@@ -1946,8 +1959,11 @@ const struct settings_list settings[] = {
 
 #ifdef HAVE_TAGCACHE
 #ifdef HAVE_TC_RAMCACHE
+#ifndef DEFAULT_TAGCACHE_RAM
+#define DEFAULT_TAGCACHE_RAM TAGCACHE_RAM_OFF
+#endif
     CHOICE_SETTING(F_BANFROMQS, tagcache_ram, LANG_TAGCACHE_RAM,
-                   0, "tagcache_ram", "off,on,quick",
+                   DEFAULT_TAGCACHE_RAM, "tagcache_ram", "off,on,quick",
                    NULL, 3,
                    ID2P(LANG_OFF), ID2P(LANG_ON), ID2P(LANG_QUICK_IGNORE_DIRACHE)),
 #endif
@@ -2316,7 +2332,8 @@ const struct settings_list settings[] = {
         ID2P(LANG_NEVER), ID2P(LANG_ALWAYS), ID2P(LANG_WHILE_USB_CHARGE_ONLY), ID2P(LANG_WHILE_MASS_STORAGE_USB_ONLY)),
 #endif
 
-#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
+#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE) && \
+    !defined(USBSTOR_EXPOSE_ALL_DRIVES)
     OFFON_SETTING(0, usb_skip_first_drive, LANG_USB_SKIP_FIRST_DRIVE, false, "usb skip first drive", usb_set_skip_first_drive),
 #endif
 

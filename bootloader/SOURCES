@@ -43,6 +43,9 @@ show_logo.c
 #elif defined(ONDA_VX747) || defined(ONDA_VX747P) || defined(ONDA_VX767) || defined(ONDA_VX777)
 ondavx747.c
 show_logo.c
+#elif defined(COLORFLY_C10)
+colorflyc10.c
+show_logo.c
 #elif defined(XDUOO_X3)
 xduoox3.c
 show_logo.c

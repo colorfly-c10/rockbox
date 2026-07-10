@@ -22,6 +22,7 @@
 #include "cpu.h"
 #include "logf.h"
 #include "i2c.h"
+#include "kernel.h"
 
 #define I2C_CHN   1
 #define I2C_CLK   100000
@@ -33,6 +34,144 @@
 #define I2C_M_WR  2
 
 #define TIMEOUT   100000
+
+#ifdef COLORFLY_C10
+#define C10_I2C_CHN 0
+
+static struct mutex c10_i2c0_mutex;
+static struct mutex c10_i2c1_mutex;
+static bool c10_i2c1_mutex_ready;
+
+static int c10_i2c0_setup(unsigned char address)
+{
+    int count = __cpm_get_pclk() / I2C_CLK - 23;
+    int timeout = TIMEOUT;
+    int ignored;
+
+    __i2c_disable(C10_I2C_CHN);
+    while (__i2c_is_enable(C10_I2C_CHN) && --timeout)
+        udelay(1);
+    if (!timeout || count < 0)
+        return -1;
+
+    REG_I2C_CTRL(C10_I2C_CHN) = 0x43 | I2C_CTRL_REST;
+    REG_I2C_SHCNT(C10_I2C_CHN) = count / 2 + 1;
+    REG_I2C_SLCNT(C10_I2C_CHN) = count / 2 + 13 + (count & 1);
+    REG_I2C_TAR(C10_I2C_CHN) = address;
+    REG_I2C_INTM(C10_I2C_CHN) = 0;
+    __i2c_clear_interrupts(ignored, C10_I2C_CHN);
+    (void)ignored;
+
+    __i2c_enable(C10_I2C_CHN);
+    timeout = TIMEOUT;
+    while (__i2c_is_disable(C10_I2C_CHN) && --timeout)
+        udelay(1);
+    return timeout ? 0 : -1;
+}
+
+static bool c10_i2c0_aborted(void)
+{
+    return (REG_I2C_INTST(C10_I2C_CHN) & I2C_INTST_TXABT) ||
+           REG_I2C_TXABRT(C10_I2C_CHN);
+}
+
+void c10_i2c0_init(void)
+{
+    /* Stock registers DAC4398 on I2C0 (PD30/PD31), while the AXP202
+     * remains on the interrupt-driven I2C1 controller. */
+    __gpio_as_i2c(C10_I2C_CHN);
+    __cpm_start_i2c0();
+    mutex_init(&c10_i2c0_mutex);
+}
+
+int c10_i2c0_write(int device, const unsigned char *buf, int count)
+{
+    int ignored;
+    int result = -1;
+
+    if (count < 1)
+        return -1;
+
+    mutex_lock(&c10_i2c0_mutex);
+    if (c10_i2c0_setup(device) < 0)
+        goto out;
+
+    while (count-- > 0)
+    {
+        int timeout = TIMEOUT;
+        while (!(REG_I2C_STA(C10_I2C_CHN) & I2C_STA_TFNF) && --timeout)
+            udelay(1);
+        if (!timeout || c10_i2c0_aborted())
+            goto error;
+        REG_I2C_DC(C10_I2C_CHN) = *buf++;
+    }
+
+    int timeout = TIMEOUT;
+    while (!(REG_I2C_STA(C10_I2C_CHN) & I2C_STA_TFE) && --timeout)
+        udelay(1);
+    while ((REG_I2C_STA(C10_I2C_CHN) & I2C_STA_MSTACT) && --timeout)
+        udelay(1);
+    if (!timeout || c10_i2c0_aborted())
+        goto error;
+    result = 0;
+    goto out;
+
+error:
+    __i2c_clear_interrupts(ignored, C10_I2C_CHN);
+    (void)ignored;
+    logf("C10 I2C0 write to %02x failed", device);
+out:
+    mutex_unlock(&c10_i2c0_mutex);
+    return result;
+}
+
+int c10_i2c0_read_reg(int device, unsigned char reg, unsigned char *value)
+{
+    int ignored;
+    int timeout;
+    int result = -1;
+
+    if (!value)
+        return -1;
+
+    mutex_lock(&c10_i2c0_mutex);
+    if (c10_i2c0_setup(device) < 0)
+        goto out;
+
+    /* Queue the subaddress and read command together. With RESTART enabled,
+     * the JZ4760 controller emits the repeated START used by SMBus byte-data
+     * reads before the write phase can terminate. */
+    REG_I2C_DC(C10_I2C_CHN) = reg;
+    REG_I2C_DC(C10_I2C_CHN) = I2C_READ << 8;
+
+    timeout = TIMEOUT;
+    while (!(REG_I2C_STA(C10_I2C_CHN) & I2C_STA_RFNE) && --timeout)
+    {
+        if (c10_i2c0_aborted())
+            goto error;
+        udelay(1);
+    }
+    if (!timeout)
+        goto error;
+
+    *value = REG_I2C_DC(C10_I2C_CHN) & 0xff;
+    timeout = TIMEOUT;
+    while ((REG_I2C_STA(C10_I2C_CHN) & I2C_STA_MSTACT) && --timeout)
+        udelay(1);
+    if (!timeout || c10_i2c0_aborted())
+        goto error;
+    result = 0;
+    goto out;
+
+error:
+    __i2c_clear_interrupts(ignored, C10_I2C_CHN);
+    (void)ignored;
+    logf("C10 I2C0 read from %02x failed", device);
+out:
+    mutex_unlock(&c10_i2c0_mutex);
+    return result;
+}
+#endif
 
 static char i2c_rwflags;
 static int i2c_ctrl_rest = 0;
@@ -260,6 +399,34 @@ R_timeout:
     return -1;
 }
 
+#ifdef COLORFLY_C10
+int c10_i2c1_read_reg(int device, unsigned char reg, unsigned char *value)
+{
+    int result;
+
+    if (!value)
+        return -1;
+
+    /* I2C1's interrupt handler uses shared transfer state. Serialize complete
+     * C10 PMIC transactions rather than only protecting the subaddress. */
+    mutex_lock(&c10_i2c1_mutex);
+    result = xfer_read_subaddr(reg, device, value, 1);
+    mutex_unlock(&c10_i2c1_mutex);
+    return result;
+}
+
+int c10_i2c1_write_reg(int device, unsigned char reg, unsigned char value)
+{
+    unsigned char data[2] = { reg, value };
+    int result;
+
+    mutex_lock(&c10_i2c1_mutex);
+    result = i2c_write(device, data, sizeof(data));
+    mutex_unlock(&c10_i2c1_mutex);
+    return result;
+}
+#endif
+
 int xfer_write_subaddr(unsigned char subaddr, unsigned char device, const unsigned char *buf, int length)
 {
     int timeout,w_i = 0;
@@ -351,6 +518,13 @@ int i2c_write(int device, const unsigned char* buf, int count)
 
 void i2c_init(void)
 {
+#ifdef COLORFLY_C10
+    if (!c10_i2c1_mutex_ready)
+    {
+        mutex_init(&c10_i2c1_mutex);
+        c10_i2c1_mutex_ready = true;
+    }
+#endif
     __gpio_as_i2c(I2C_CHN);
     __cpm_start_i2c1();
     system_enable_irq(IRQ_I2C1);

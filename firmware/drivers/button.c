@@ -67,7 +67,10 @@ static bool enable_sw_poweroff = true;
 #endif
 
 /* how long until repeat kicks in, in centiseconds */
-#define REPEAT_START      (30*HZ/100)
+#ifndef BUTTON_REPEAT_START
+#define BUTTON_REPEAT_START 30
+#endif
+#define REPEAT_START      (BUTTON_REPEAT_START*HZ/100)
 
 /* The next two make repeat "accelerate", which is nice for lists
  * which begin to scroll a bit faster when holding until the

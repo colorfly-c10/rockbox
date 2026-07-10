@@ -96,7 +96,7 @@ typedef unsigned long sector_t;
    The tokens must be outside of legal filename characters */
 #define VOL_START_TOK    '<'
 #define VOL_END_TOK      '>'
-#define VOL_DEC_MAX_LEN  7 /* biggest of all xxx_VOL_DEC defines */
+#define VOL_DEC_MAX_LEN  8 /* biggest of all xxx_VOL_DEC defines */
 #define VOL_MAX_LEN      (1 + VOL_DEC_MAX_LEN + 2 + 1)
 #define VOL_NUM_MAX      100
 

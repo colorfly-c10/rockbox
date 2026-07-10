@@ -90,6 +90,9 @@ void udelay(unsigned int usec);
 void mdelay(unsigned int msec);
 void dma_enable(void);
 void dma_disable(void);
+#ifdef COLORFLY_C10
+void c10_pmic_power_off(void);
+#endif
 
 #if CONFIG_CPU == JZ4732
 #define DMA_AIC_TX_CHANNEL 0
@@ -97,6 +100,18 @@ void dma_disable(void);
 #define DMA_USB_CHANNEL    2
 #define DMA_LCD_CHANNEL    3
 #elif CONFIG_CPU == JZ4760B
+#ifdef COLORFLY_C10
+/* The stock C10 kernel reserves DMAC1 channel 0 (global channel 6) for AIC
+ * TX and assigns MSC2 to DMAC0 channel 2. Rockbox uses channel 3 for MSC0.
+ * One channel per controller is reused for both directions by changing DRSR;
+ * each drive mutex serializes it and keeps storage off AIC's controller. */
+#define DMA_AIC_TX_CHANNEL 6
+#define DMA_USB_CHANNEL    1
+#define DMA_SD_RX_CHANNEL0 3
+#define DMA_SD_RX_CHANNEL1 2
+#define DMA_SD_TX_CHANNEL0 3
+#define DMA_SD_TX_CHANNEL1 2
+#else
 #define DMA_AIC_TX_CHANNEL 0
 #define DMA_USB_CHANNEL    1
 // Note:  channel 5 and 11 cannot be used!
@@ -104,9 +119,10 @@ void dma_disable(void);
 #define DMA_SD_RX_CHANNEL1 7
 #define DMA_SD_TX_CHANNEL0 8
 #define DMA_SD_TX_CHANNEL1 9
+#endif
 #define DMA_NAND_CHANNEL   10
-#define DMA_SD_RX_CHANNEL(n)  6+n
-#define DMA_SD_TX_CHANNEL(n)  8+n
+#define DMA_SD_RX_CHANNEL(n)  (DMA_SD_RX_CHANNEL0 + (n))
+#define DMA_SD_TX_CHANNEL(n)  (DMA_SD_TX_CHANNEL0 + (n))
 #endif
 
 #define XDMA_CALLBACK(n) DMA ## n

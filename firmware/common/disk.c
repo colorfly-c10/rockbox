@@ -29,6 +29,9 @@
 #include "rb_namespace.h"
 #include "disk.h"
 #include "panic.h"
+#ifdef STORAGE_VOLUME_DECORATION
+#include "pathfuncs.h"
+#endif
 
 #if defined(HAVE_BOOTDATA) && !defined(SIMULATOR) && !defined(BOOTLOADER)
 #include "bootdata.h"
@@ -193,7 +196,10 @@ bool disk_init(IF_MD_NONVOID(int drive))
 #endif  /* STORAGE_ATA */
 
     memset(sector, 0, DC_CACHE_BUFSIZE);
-    storage_read_sectors(IF_MD(drive,) 0, 1, sector);
+    if (storage_read_sectors(IF_MD(drive,) 0, 1, sector) != 0) {
+        dc_release_buffer(sector);
+        return false;
+    }
 
     bool init = false;
 
@@ -441,6 +447,10 @@ int disk_mount(int drive)
              volume != -1 && i < MAX_PARTITIONS_PER_DRIVE && mounted < NUM_VOLUMES_PER_DRIVE;
              i++)
         {
+#ifdef STORAGE_PARTITION_FILTER
+            if (!STORAGE_PARTITION_FILTER(drive, i))
+                continue;
+#endif
             if (pinfo[i].type == 0x05 ||
                 pinfo[i].type == 0x0f ||
                 (i != 0 && pinfo[i].type == 0))
@@ -515,6 +525,10 @@ int disk_mount_all(void)
     }
 
     disk_writer_unlock();
+#ifdef STORAGE_VOLUME_DECORATION
+    /* Target-specific names can depend on the drive assigned at mount time. */
+    init_volume_names();
+#endif
     return mounted;
 }
 

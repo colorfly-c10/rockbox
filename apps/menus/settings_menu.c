@@ -371,7 +371,8 @@ MENUITEM_SETTING(usb_keypad_mode, &global_settings.usb_keypad_mode, NULL);
 #ifdef USB_ENABLE_AUDIO
 MENUITEM_SETTING(usb_audio, &global_settings.usb_audio, NULL);
 #endif
-#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
+#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE) && \
+    !defined(USBSTOR_EXPOSE_ALL_DRIVES)
 MENUITEM_SETTING(usb_skip_first_drive, &global_settings.usb_skip_first_drive, NULL);
 #endif
 
@@ -424,7 +425,8 @@ MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
 #ifdef USB_ENABLE_AUDIO
             &usb_audio,
 #endif
-#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
+#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE) && \
+    !defined(USBSTOR_EXPOSE_ALL_DRIVES)
             &usb_skip_first_drive,
 #endif
 #ifdef HAVE_USB_MODE
@@ -481,7 +483,8 @@ MAKE_MENU(system_menu, ID2P(LANG_SYSTEM),
 #endif
 #if defined(USB_ENABLE_HID) || \
     defined(USB_ENABLE_AUDIO) || \
-    (defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)) || \
+    (defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE) && \
+     !defined(USBSTOR_EXPOSE_ALL_DRIVES)) || \
     defined(HAVE_USB_MODE)
             &usb_menu,
 #endif

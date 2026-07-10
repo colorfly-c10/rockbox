@@ -221,6 +221,9 @@ static void NORETURN_ATTR storage_thread(void)
                 }
 
                 if (umnt > 0 || mnt > 0) {
+#ifdef STORAGE_VOLUME_DECORATION
+                    init_volume_names();
+#endif
                     /* something was unmounted and/or mounted */
                     queue_broadcast(SYS_FS_CHANGED, drive);
                 }

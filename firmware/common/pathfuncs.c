@@ -34,6 +34,7 @@
 
 static char vol_dec_strings[NUM_VOLUMES][ALIGN_UP(VOL_MAX_LEN+2, 4)] = {{0}};
 
+#ifndef STORAGE_VOLUME_DECORATION
 enum storage_name_dec_indexes
 {
 #if (CONFIG_STORAGE & STORAGE_ATA)
@@ -111,6 +112,7 @@ static const unsigned char storage_dec_indexes[STORAGE_NUM_TYPES+1] =
     [STORAGE_HOSTFS_NUM]  = STORAGE_DEC_IDX_HOSTFS,
 #endif
 };
+#endif
 
 /* builds a list of drive/volume specifiers <volstr#> */
 void init_volume_names(void)
@@ -121,10 +123,15 @@ void init_volume_names(void)
         const char *voldec = "";
         char *buffer = vol_dec_strings[volume];
 
-        int type = storage_driver_type(volume_drive(volume));
+        int drive = volume_drive(volume);
+#ifdef STORAGE_VOLUME_DECORATION
+        voldec = STORAGE_VOLUME_DECORATION(drive);
+#else
+        int type = storage_driver_type(drive);
         if (type < 0 || type > STORAGE_NUM_TYPES)
             type = STORAGE_NUM_TYPES;
         voldec = storage_dec_names[storage_dec_indexes[type]];
+#endif
         snprintf(buffer, VOL_MAX_LEN + 1, "%c%s%d%c",
                 VOL_START_TOK, voldec, volume, VOL_END_TOK);
         DEBUGF("vol<%d> = %s ", volume, buffer);

@@ -30,13 +30,24 @@
 #include "thread.h"
 
 #define USE_USB_DMA
+#ifndef COLORFLY_C10
+#define USE_USB_DMA_RX
+#else
+/* RX DMA does not complete the first mass-storage command after BootROM handoff. */
+#endif
 
+#ifndef COLORFLY_C10
 #define PIN_USB_DET      (32*4+19)
 #define IRQ_USB_DET      GPIO_IRQ(PIN_USB_DET)
 #define GPIO_USB_DET     GPIO147
 
 #define PIN_USB_DRVVBUS  (32*4+10)
 #define PIN_USB_OTG_ID   (32*3+7)
+#else
+/* C10 VBUS is detected by the AXP202. The PMIC worker maintains this state
+ * because usb_start_monitoring() calls usb_detect() with IRQs disabled. */
+extern int c10_usb_detect(void);
+#endif
 
 #define EP_BUF_LEFT(ep)  ((ep)->length - (ep)->sent)
 #define EP_PTR(ep)       ((void*)((unsigned int)(ep)->buf + (ep)->sent))
@@ -97,6 +108,14 @@ static union {
 
 static volatile bool ep0_data_supplied = false;
 static volatile bool ep0_data_requested = false;
+
+#ifdef COLORFLY_C10
+static volatile bool c10_ep0_status_in_pending;
+static volatile bool c10_ep0_status_out_pending;
+static volatile bool c10_ep0_status_out_active;
+static volatile bool c10_ep0_setup_ack_pending;
+static volatile int c10_ep0_pending_address;
+#endif
 
 static struct usb_endpoint endpoints[] =
 {
@@ -216,16 +235,25 @@ static void EP0_send(void)
 {
     struct usb_endpoint* ep = &endpoints[0];
     unsigned int length;
+#ifndef COLORFLY_C10
     unsigned short csr0;
+#endif
 
     select_endpoint(0);
+#ifndef COLORFLY_C10
     csr0 = REG_USB_CSR0;
 
     logf("%s(): 0x%x %d %d", __func__, csr0, ep->sent, ep->length);
+#else
+    logf("%s(): 0x%x %d %d", __func__, REG_USB_CSR0,
+         ep->sent, ep->length);
+#endif
 
     if (ep->sent == 0) {
         length = MIN(ep->length, ep->fifo_size);
+#ifndef COLORFLY_C10
         REG_USB_CSR0 = (csr0 | USB_CSR0_FLUSHFIFO);
+#endif
     } else {
         length = MIN(EP_BUF_LEFT(ep), ep->fifo_size);
     }
@@ -234,14 +262,25 @@ static void EP0_send(void)
     ep->sent += length;
 
     if (ep->sent >= ep->length) {
+#ifdef COLORFLY_C10
+        /* The JZ4760B MUSB core must not be fed stale setup-stage CSR bits.
+         * The stock Linux driver likewise writes only TXPKTRDY|DATAEND here. */
+        c10_ep0_status_out_active = c10_ep0_status_out_pending;
+        REG_USB_CSR0 = USB_CSR0_INPKTRDY | USB_CSR0_DATAEND;
+#else
         REG_USB_CSR0 = (csr0 | USB_CSR0_INPKTRDY | USB_CSR0_DATAEND); /* Set data end! */
+#endif
         if (!ep->wait) {
             usb_core_transfer_complete(EP_CONTROL, USB_DIR_IN, 0, ep->sent);
 	}
         ep->rc = 0;
         ep_transfer_completed(ep);
     } else {
+#ifdef COLORFLY_C10
+        REG_USB_CSR0 = USB_CSR0_INPKTRDY;
+#else
         REG_USB_CSR0 = (csr0 | USB_CSR0_INPKTRDY);
+#endif
     }
 }
 
@@ -275,6 +314,13 @@ static void EP0_handler(void)
         REG_USB_CSR0 = csr0;
         ep0_data_supplied = false;
         ep0_data_requested = false;
+#ifdef COLORFLY_C10
+        c10_ep0_status_in_pending = false;
+        c10_ep0_status_out_pending = false;
+        c10_ep0_status_out_active = false;
+        c10_ep0_setup_ack_pending = false;
+        c10_ep0_pending_address = -1;
+#endif
         if (ep_send->busy) {
             if (!ep_send->wait)
                 usb_core_transfer_complete(EP_CONTROL, USB_DIR_IN, -1, 0);
@@ -286,8 +332,50 @@ static void EP0_handler(void)
         }
     }
 
+#ifdef COLORFLY_C10
+    /* usb_core's current control API expects the driver to report both
+     * status stages. The old JZ4760 driver predates that API and silently
+     * discarded its zero-length transfers, leaving the core permanently
+     * busy after the first descriptor request. */
+    if (c10_ep0_status_in_pending && !(csr0 & USB_CSR0_INPKTRDY)) {
+        c10_ep0_status_in_pending = false;
+        if (c10_ep0_pending_address >= 0) {
+            REG_USB_FADDR = c10_ep0_pending_address;
+            c10_ep0_pending_address = -1;
+        }
+        usb_core_transfer_complete(EP_CONTROL, USB_DIR_IN, 0, 0);
+        csr0 = REG_USB_CSR0;
+    }
+
+    /* MUSB normally reports the status-OUT phase of a control-IN transfer
+     * as an EP0 interrupt with RXPKTRDY clear. A new setup packet can be
+     * coalesced into that interrupt, in which case its eight bytes are
+     * already in the FIFO. Complete the old transfer before delivering the
+     * new setup request so usb_core returns EP0 to READY. */
+    if (c10_ep0_status_out_pending && c10_ep0_status_out_active &&
+        (!(csr0 & USB_CSR0_OUTPKTRDY) || REG_USB_COUNT0 == 8)) {
+        c10_ep0_status_out_pending = false;
+        c10_ep0_status_out_active = false;
+        ep0_data_supplied = false;
+        ep0_data_requested = false;
+        usb_core_transfer_complete(EP_CONTROL, USB_DIR_OUT, 0, 0);
+        csr0 = REG_USB_CSR0;
+    }
+#endif
+
     /* Call relevant routines for endpoint 0 state */
     if (csr0 & USB_CSR0_OUTPKTRDY) { /* There is a packet in the fifo */
+#ifdef COLORFLY_C10
+        if (c10_ep0_status_out_pending && REG_USB_COUNT0 == 0) {
+            c10_ep0_status_out_pending = false;
+            c10_ep0_status_out_active = false;
+            ep0_data_supplied = false;
+            ep0_data_requested = false;
+            REG_USB_CSR0 = USB_CSR0_SVDOUTPKTRDY;
+            usb_core_transfer_complete(EP_CONTROL, USB_DIR_OUT, 0, 0);
+            return;
+        }
+#endif
         if (ep_send->busy) {
             if (!ep_send->wait) {
                 usb_core_transfer_complete(EP_CONTROL, USB_DIR_IN, -1, 0);
@@ -308,17 +396,42 @@ static void EP0_handler(void)
         } else if (!ep0_data_supplied) {
             ep_recv->buf = ep0_rx.buf;
             readFIFO(ep_recv, REG_USB_COUNT0);
-            csr0 |= USB_CSR0_SVDOUTPKTRDY;
+#ifdef COLORFLY_C10
+            if (ep0_rx.request.bRequest == USB_REQ_SET_ADDRESS &&
+                ep0_rx.request.bRequestType ==
+                    (USB_TYPE_STANDARD | USB_RECIP_DEVICE) &&
+                ep0_rx.request.wLength == 0)
+                c10_ep0_pending_address = ep0_rx.request.wValue & 0x7f;
+#endif
             if (!ep0_rx.request.wLength) {
+#ifndef COLORFLY_C10
+                csr0 |= USB_CSR0_SVDOUTPKTRDY;
                 csr0 |= USB_CSR0_DATAEND; /* Set data end! */
+#endif
                 ep0_data_requested = false;
                 ep0_data_supplied = false;
             } else if (ep0_rx.request.bRequestType & USB_DIR_IN) {
+                csr0 |= USB_CSR0_SVDOUTPKTRDY;
                 ep0_data_requested = true;
             } else {
+                csr0 |= USB_CSR0_SVDOUTPKTRDY;
         	ep0_data_supplied = true;
-	    }
+            }
+#ifdef COLORFLY_C10
+            if (!ep0_rx.request.wLength) {
+                /* Keep RXPKTRDY asserted until usb_core accepts or stalls
+                 * this request. Mask EP0 so the same setup packet is not
+                 * delivered repeatedly while the USB thread handles it. */
+                c10_ep0_setup_ack_pending = true;
+                REG_USB_INTRINE &= ~USB_INTR_EP(0);
+            } else {
+                REG_USB_CSR0 = csr0;
+                while (REG_USB_CSR0 & USB_CSR0_OUTPKTRDY)
+                    asm volatile("nop");
+            }
+#else
             REG_USB_CSR0 = csr0;
+#endif
             usb_core_setup_received(&ep0_rx.request);
             ep_transfer_completed(ep_recv);
         }
@@ -508,7 +621,7 @@ static void EPOUT_handler(unsigned int endpoint)
             return;
         }
 
-#ifdef USE_USB_DMA
+#ifdef USE_USB_DMA_RX
         if (ep->use_dma >= 0) {
             logf("DMA busy(%x %x %x)", REG_USB_ADDR(USB_INTR_DMA_BULKOUT), REG_USB_COUNT(USB_INTR_DMA_BULKOUT),REG_USB_CNTL(USB_INTR_DMA_BULKOUT));
             return;
@@ -589,7 +702,7 @@ static void EPOUT_ready(unsigned int endpoint)
 {
     logf("%s(%d)", __func__, endpoint);
 
-#ifdef USE_USB_DMA
+#ifdef USE_USB_DMA_RX
     struct usb_endpoint* ep = &endpoints[endpoint*2+1];
     unsigned int csr;
 
@@ -682,10 +795,12 @@ static void EPDMA_handler(int number)
         ep->use_dma = -1; /* DMA is complete, mark channel as idle */
 
         EPIN_complete(endpoint);
+#ifdef USE_USB_DMA_RX
     } else if (number == USB_INTR_DMA_BULKOUT) {
         /* RX DMA completed */
         logf("DMA RX%d %d @%d/%d", number, size, ep->received, ep->length);
         EPOUT_ready(endpoint);
+#endif
     } else if (ep) {
         ep->use_dma = -1;
     }
@@ -772,6 +887,13 @@ static void udc_reset(void)
 
     REG_USB_FADDR = 0;
     REG_USB_INDEX = 0;
+#ifdef COLORFLY_C10
+    c10_ep0_status_in_pending = false;
+    c10_ep0_status_out_pending = false;
+    c10_ep0_status_out_active = false;
+    c10_ep0_setup_ack_pending = false;
+    c10_ep0_pending_address = -1;
+#endif
 
     /* Disable interrupts */
     REG_USB_INTRINE  = 0;
@@ -783,7 +905,13 @@ static void udc_reset(void)
     REG_USB_CNTL(USB_INTR_DMA_BULKOUT) = 0;
 
     /* High speed, softconnect */
+#ifdef COLORFLY_C10
+    /* usb_drv_init() connects only after EP0 and its interrupts are ready.
+     * A bus reset must retain the controller's current connection state. */
+    REG_USB_POWER |= USB_POWER_HSENAB | USB_POWER_ISOUPDATE;
+#else
     REG_USB_POWER = (USB_POWER_SOFTCONN | USB_POWER_HSENAB);
+#endif
 
     /* Reset EP0 */
     select_endpoint(0);
@@ -837,11 +965,12 @@ void OTG(void)
     unsigned short   intrOut = REG_USB_INTROUT;
 #ifdef USE_USB_DMA
     unsigned char    intrDMA = REG_USB_INTR;
+    logf("IRQ %x %x %x %x", intrUSB, intrIn, intrOut, intrDMA);
+#else
+    logf("IRQ %x %x %x", intrUSB, intrIn, intrOut);
 #endif
 
-    logf("IRQ %x %x %x %x", intrUSB, intrIn, intrOut, intrDMA);
-
-    /* EPIN & EPOUT are all handled in DMA */
+    /* Handle endpoint interrupt sources. */
     if (intrIn & USB_INTR_EP(0))
         EP0_handler();
     if (intrIn & USB_INTR_EP(1))
@@ -861,8 +990,10 @@ void OTG(void)
 #ifdef USE_USB_DMA
     if (intrDMA & (1<<USB_INTR_DMA_BULKIN))
         EPDMA_handler(USB_INTR_DMA_BULKIN);
+#ifdef USE_USB_DMA_RX
     if (intrDMA & (1<<USB_INTR_DMA_BULKOUT))
         EPDMA_handler(USB_INTR_DMA_BULKOUT);
+#endif
 #endif
 }
 
@@ -893,10 +1024,20 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
     select_endpoint(endpoint);
 
     if(endpoint == EP_CONTROL) {
-        if(stall)
+        if(stall) {
+#ifdef COLORFLY_C10
+            if (c10_ep0_setup_ack_pending) {
+                c10_ep0_setup_ack_pending = false;
+                REG_USB_INTRINE |= USB_INTR_EP(0);
+                REG_USB_CSR0 = USB_CSR0_SVDOUTPKTRDY |
+                    USB_CSR0_DATAEND | USB_CSR0_SENDSTALL;
+                return;
+            }
+#endif
             REG_USB_CSR0 |= USB_CSR0_SENDSTALL;
-        else
+        } else {
             REG_USB_CSR0 &= ~USB_CSR0_SENDSTALL;
+        }
     } else {
         if(in) {
             if(stall)
@@ -914,12 +1055,17 @@ void usb_drv_stall(int endpoint, bool stall, bool in)
 
 int usb_detect(void)
 {
+#ifdef COLORFLY_C10
+    return c10_usb_detect();
+#else
     return (__gpio_get_pin(PIN_USB_DET) == 1)
         ? USB_INSERTED : USB_EXTRACTED;
+#endif
 }
 
 void usb_init_device(void)
 {
+#ifndef COLORFLY_C10
     __gpio_clear_pin(PIN_USB_DRVVBUS);
     __gpio_as_output(PIN_USB_DRVVBUS);
 
@@ -933,6 +1079,7 @@ void usb_init_device(void)
     __gpio_as_irq_rise_edge(PIN_USB_DET);
     system_enable_irq(IRQ_USB_DET);
 #endif
+#endif
 
     system_enable_irq(IRQ_OTG);
 
@@ -940,7 +1087,7 @@ void usb_init_device(void)
         semaphore_init(&endpoints[i].complete, 1, 0);
 }
 
-#ifdef USB_STATUS_BY_EVENT
+#if defined(USB_STATUS_BY_EVENT) && !defined(COLORFLY_C10)
 static int usb_oneshot_callback(struct timeout *tmo)
 {
     (void)tmo;
@@ -982,6 +1129,15 @@ void usb_drv_init(void)
 {
     logf("%s()", __func__);
 
+#ifdef COLORFLY_C10
+    /* Configure the controller while disconnected. Exposing the pull-up
+     * before EP0 is ready makes the host's first descriptor request race us. */
+    REG_USB_POWER = USB_POWER_HSENAB | USB_POWER_ISOUPDATE;
+    REG_USB_DEVCTL &= ~USB_DEVCTL_SESSION;
+    mdelay(20);
+    udc_reset();
+    REG_USB_POWER |= USB_POWER_SOFTCONN;
+#else
     /* Dis- and reconnect from USB */
     REG_USB_POWER &= ~USB_POWER_SOFTCONN;
     mdelay(20);
@@ -989,6 +1145,7 @@ void usb_drv_init(void)
     mdelay(20);
 
     udc_reset();
+#endif
 }
 
 void usb_drv_exit(void)
@@ -1022,7 +1179,17 @@ void usb_drv_set_address(int address)
 {
     logf("%s(%d)", __func__, address);
 
+#ifdef COLORFLY_C10
+    /* usb_core queues the status handshake before setting the address. If
+     * its IRQ has already completed, apply the address here; otherwise the
+     * EP0 completion path applies it after the handshake. */
+    if (c10_ep0_status_in_pending)
+        c10_ep0_pending_address = address;
+    else
+        REG_USB_FADDR = address;
+#else
     REG_USB_FADDR = address;
+#endif
 }
 
 static void usb_drv_send_internal(struct usb_endpoint* ep, void* ptr, int length, bool blocking)
@@ -1030,7 +1197,22 @@ static void usb_drv_send_internal(struct usb_endpoint* ep, void* ptr, int length
     int flags = disable_irq_save();
 
     if (ep->type == ep_control) {
-        if ((ptr == NULL && length == 0) || !ep0_data_requested) {
+        if (ptr == NULL && length == 0) {
+#ifdef COLORFLY_C10
+            select_endpoint(0);
+            /* A no-data control-OUT request has no IN data packet. The
+             * JZ4760B MUSB core generates its status-IN handshake when
+             * the pending setup acknowledgement and DATAEND are asserted
+             * together. TXPKTRDY produces a malformed SET_ADDRESS. */
+            c10_ep0_status_in_pending = true;
+            c10_ep0_setup_ack_pending = false;
+            REG_USB_INTRINE |= USB_INTR_EP(0);
+            REG_USB_CSR0 = USB_CSR0_SVDOUTPKTRDY | USB_CSR0_DATAEND;
+#endif
+            restore_irq(flags);
+            return;
+        }
+        if (!ep0_data_requested) {
             restore_irq(flags);
             return;
         }
@@ -1098,8 +1280,17 @@ int usb_drv_recv_nonblocking(int endpoint, void* ptr, int length)
 
     logf("%s(%d, 0x%x, %d)", __func__, endpoint, (int)ptr, length);
 
-    if (ptr == NULL || length == 0)
+    if (ptr == NULL || length == 0) {
+#ifdef COLORFLY_C10
+        if (endpoint == EP_CONTROL) {
+            int flags = disable_irq_save();
+            c10_ep0_status_out_pending = true;
+            c10_ep0_status_out_active = false;
+            restore_irq(flags);
+        }
+#endif
         return 0;
+    }
 
     ep = &endpoints[endpoint*2+1];
 
@@ -1168,6 +1359,13 @@ void usb_drv_cancel_all_transfers(void)
 
     for(i=0; i<TOTAL_EP(); i++)
     {
+#ifdef COLORFLY_C10
+        /* SET_ADDRESS asks the driver to cancel old data transfers while
+         * its setup packet is still held in EP0 for the deferred status
+         * reply. Flushing either EP0 direction here destroys that packet. */
+        if (c10_ep0_setup_ack_pending && i < 2)
+            continue;
+#endif
         if (endpoints[i].busy)
         {
             if (i & 1)

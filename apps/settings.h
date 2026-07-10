@@ -818,7 +818,8 @@ struct user_settings
     int usb_audio;
 #endif
 
-#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
+#if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE) && \
+    !defined(USBSTOR_EXPOSE_ALL_DRIVES)
     bool usb_skip_first_drive;
 #endif
 
