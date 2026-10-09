@@ -444,6 +444,11 @@ int disk_mount(int drive)
              volume != -1 && i < MAX_PARTITIONS_PER_DRIVE && mounted < NUM_VOLUMES_PER_DRIVE;
              i++)
         {
+#ifdef STORAGE_PARTITION_FILTER
+            /* Some targets share a disk with the stock boot/system partitions. */
+            if (!STORAGE_PARTITION_FILTER(drive, i))
+                continue;
+#endif
             if (pinfo[i].type == 0x05 ||
                 pinfo[i].type == 0x0f ||
                 (i != 0 && pinfo[i].type == 0))
