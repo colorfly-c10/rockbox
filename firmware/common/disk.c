@@ -193,7 +193,10 @@ bool disk_init(IF_MD_NONVOID(int drive))
 #endif  /* STORAGE_ATA */
 
     memset(sector, 0, DC_CACHE_BUFSIZE);
-    storage_read_sectors(IF_MD(drive,) 0, 1, sector);
+    if (storage_read_sectors(IF_MD(drive,) 0, 1, sector) != 0) {
+        dc_release_buffer(sector);
+        return false;
+    }
 
     bool init = false;
 
