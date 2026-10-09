@@ -6996,6 +6996,7 @@ do {								\
 #define USB_OUTCOUNT		(USB_BASE + 0x18) /* EP1-15 OUT FIFO count 16-bit */
 
 #define USB_CONFIGDATA          (USB_BASE + 0x1f) /* Fixed config */
+#define USB_DEVCTL              (USB_BASE + 0x60) /* Device control 8-bit */
 
 #define USB_FIFO_EP(n)		(USB_BASE + (n)*4 + 0x20)
 
@@ -7015,6 +7016,10 @@ do {								\
 #define USB_POWER_HSMODE	0x10
 #define USB_POWER_HSENAB	0x20
 #define USB_POWER_SOFTCONN	0x40
+#define USB_POWER_ISOUPDATE	0x80
+
+/* Device control register bit masks */
+#define USB_DEVCTL_SESSION      0x01
 
 /* Interrupt register bit masks */
 #define USB_INTR_SUSPEND	0x01
@@ -7122,6 +7127,7 @@ do {								\
 #define REG_USB_OUTCOUNT	REG16(USB_OUTCOUNT)
 
 #define REG_USB_CONFIGDATA      REG8(USB_CONFIGDATA)
+#define REG_USB_DEVCTL          REG8(USB_DEVCTL)
 #define REG_USB_FIFO_EP(n)	REG32(USB_FIFO_EP(n))
 
 #define REG_USB_INTR		REG8(USB_INTR)
