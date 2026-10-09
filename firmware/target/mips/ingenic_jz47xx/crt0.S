@@ -36,6 +36,9 @@
 
 #include "config.h"
 #include "mips.h"
+#if defined(HAVE_BOOTDATA) && !defined(BOOTLOADER)
+#include "bootdata.h"
+#endif
 
     .text
 
@@ -69,6 +72,12 @@ _relocate_loop:
 #endif
 
 _start:
+#if defined(HAVE_BOOTDATA) && !defined(BOOTLOADER)
+    b       1f
+    nop
+    put_boot_data_here
+1:
+#endif
     la      ra, _start
     /*
       ----------------------------------------------------
