@@ -380,7 +380,12 @@ static bool check_disk_present(IF_MD_NONVOID(int volume))
 static void usb_storage_notify_hotswap(int volume,bool inserted)
 {
     logf("notify %d",inserted);
-    if(inserted && check_disk_present(IF_MD(volume))) {
+    bool present = inserted && check_disk_present(IF_MD(volume));
+#ifdef USBSTOR_PARTITION_INDEX
+    /* Partition-only LUNs need fresh geometry when removable media changes. */
+    present = present && disk_init(IF_MD(volume));
+#endif
+    if(present) {
         ejected[volume] = false;
     }
     else {
@@ -479,7 +484,19 @@ static int usb_storage_init_connection(void)
     int i;
     for(i=0;i<storage_num_drives();i++) {
         locked[i] = false;
-        ejected[i] = !check_disk_present(IF_MD(i));
+#ifdef USBSTOR_PARTITION_INDEX
+        /* SET_CONFIGURATION runs before USB has exclusive storage access.
+         * Use the mounted disk's partition table here; reading it again can
+         * race filesystem I/O. USB hotplug insertion refreshes it separately. */
+#ifdef HAVE_HOTSWAP
+        bool present = !storage_removable(i) || storage_present(i);
+#else
+        bool present = true;
+#endif
+#else
+        bool present = check_disk_present(IF_MD(i));
+#endif
+        ejected[i] = !present;
         queue_broadcast(SYS_USB_LUN_LOCKED, (i<<16)+0);
     }
     return 0;
@@ -772,6 +789,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     struct storage_info info;
     unsigned int length = cbw->data_transfer_length;
     sector_t block_count;
+    sector_t sector_offset = 0;
     unsigned int block_size;
     bool lun_present=true;
     unsigned char lun = cbw->lun;
@@ -798,6 +816,27 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 #else
     block_size=info.sector_size;
     block_count=info.num_sectors;
+#endif
+
+#ifdef USBSTOR_PARTITION_INDEX
+    /* A partition LUN reports partition-sized capacity and translates host
+     * LBAs to physical disk sectors. Validate the complete interval before
+     * applying the offset to any read/write command below. */
+    struct partinfo pinfo;
+    int partition = lun * MAX_PARTITIONS_PER_DRIVE +
+                    USBSTOR_PARTITION_INDEX(lun);
+
+    if (!disk_partinfo(partition, &pinfo) || pinfo.size == 0 ||
+        pinfo.start >= block_count || pinfo.size > block_count - pinfo.start)
+    {
+        lun_present = false;
+        block_count = 0;
+    }
+    else
+    {
+        sector_offset = pinfo.start;
+        block_count = pinfo.size;
+    }
 #endif
 
     if(storage_removable(lun) && !storage_present(lun))
@@ -1175,6 +1214,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
             }
             else {
+                cur_cmd.sector += sector_offset;
 #ifdef USB_USE_RAMDISK
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
@@ -1226,6 +1266,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
             }
             else {
+                cur_cmd.sector += sector_offset;
 #ifdef USB_USE_RAMDISK
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
@@ -1270,6 +1311,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
             }
             else {
+                cur_cmd.sector += sector_offset;
                 receive_block_data(cur_cmd.data[0],
                         MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
             }
@@ -1311,6 +1353,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 cur_sense_data.ascq=0;
             }
             else {
+                cur_cmd.sector += sector_offset;
                 receive_block_data(cur_cmd.data[0],
                         MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
             }
