@@ -31,8 +31,22 @@
 #include "panic.h"
 
 #define SD_INTERRUPT 0   // COMPLETELY BROKEN!
+#ifdef JZ4760_DMA_DES8
 #define SD_DMA_ENABLE 1
+#else
+/* The legacy alignment bug kept transfers on PIO. Its DMA completion path
+ * shares the command semaphore and is known to hang; retain PIO by default. */
+#define SD_DMA_ENABLE 0
+#endif
+#ifndef SD_DMA_INTERRUPT
+#ifdef JZ4760_DMA_DES8
+/* Descriptor transfers poll completion; command/data IRQs must not satisfy
+ * the DMA wait through the legacy shared semaphore. */
+#define SD_DMA_INTERRUPT 0
+#else
 #define SD_DMA_INTERRUPT 1  // HANGS RANDOMLY!
+#endif
+#endif
 #define SD_AUTO_CLOCK 1
 
 #if NUM_DRIVES > 2
@@ -64,7 +78,79 @@ static int                use_sbc[NUM_DRIVES];
 #define SD_SLOT_1  0       /* SD card 1 */
 #define SD_SLOT_2  1       /* SD card 2 */
 
+#ifndef MSC_CHN
 #define MSC_CHN(n) (2-n)
+#endif
+
+#ifdef JZ4760_DMA_DES8
+static unsigned int jz_sd_dma_request(const int drive, const bool write)
+{
+    switch (MSC_CHN(drive)) {
+    case 0:
+        return write ? DMAC_DRSR_RS_MSC0OUT : DMAC_DRSR_RS_MSC0IN;
+    case 1:
+        return write ? DMAC_DRSR_RS_MSC1OUT : DMAC_DRSR_RS_MSC1IN;
+    default:
+        return write ? DMAC_DRSR_RS_MSC2OUT : DMAC_DRSR_RS_MSC2IN;
+    }
+}
+#endif
+
+#ifdef JZ4760_DMA_DES8
+/* Eight-word descriptors must occupy their own cache line. Select a DMA
+ * transfer unit matching both the buffer alignment and its length. */
+
+
+static struct jz_dma_desc rx_desc[NUM_DRIVES] CACHEALIGN_ATTR;
+static struct jz_dma_desc tx_desc[NUM_DRIVES] CACHEALIGN_ATTR;
+
+static unsigned int jz_msc_dma_geometry(const void *buffer,
+                                         unsigned int bytes,
+                                         unsigned int *count)
+{
+    const unsigned long address = (unsigned long)buffer;
+
+    /* The stock scatter-DMA builder uses 32-bit descriptors for an
+     * unaligned head/tail and larger units only where both the memory
+     * address and length have the required alignment. A 64-byte unit at a
+     * merely word-aligned Rockbox file buffer makes DMAC halt with AR. */
+    if (((address | bytes) & 63) == 0) {
+        *count = bytes >> 6;
+        return DMAC_DCMD_DS_64BYTE;
+    }
+    if (((address | bytes) & 31) == 0) {
+        *count = bytes >> 5;
+        return DMAC_DCMD_DS_32BYTE;
+    }
+    if (((address | bytes) & 15) == 0) {
+        *count = bytes >> 4;
+        return DMAC_DCMD_DS_16BYTE;
+    }
+
+    *count = bytes >> 2;
+    return DMAC_DCMD_DS_32BIT;
+}
+
+static void jz_msc_dma_stop(const int channel)
+{
+    const int controller = channel / HALF_DMA_NUM;
+    const unsigned int pending = 1u << (channel % HALF_DMA_NUM);
+
+    /* Match jz_mmc_stop_dma() from the stock kernel.  In particular, do not
+     * leave CT/HLT or a terminal-descriptor interrupt pending for the next
+     * command: the card can otherwise report UNDERRUN on the following R1. */
+    REG_DMAC_DCCSR(channel) = 0;
+    REG_DMAC_DCMD(channel) = 0;
+    REG_DMAC_DSAR(channel) = 0;
+    REG_DMAC_DTAR(channel) = 0;
+    REG_DMAC_DTCR(channel) = 0;
+    REG_DMAC_DRSR(channel) = 0;
+    REG_DMAC_DDA(channel) = 0;
+    REG_DMAC_DMAIPR(controller) &= ~pending;
+    REG_DMAC_DMACR(controller) &= ~(DMAC_DMACR_HLT | DMAC_DMACR_AR);
+}
+
+#endif
 
 #define SD_IRQ_MASK(n)                \
 do {                                  \
@@ -104,7 +190,21 @@ enum sd_result_t
 /* Standard MMC/SD clock speeds */
 #define MMC_CLOCK_SLOW    400000      /* 400 kHz for initial setup */
 #define SD_CLOCK_FAST   24000000      /* 24 MHz for SD Cards */
+#ifndef SD_CLOCK_HIGH
 #define SD_CLOCK_HIGH   48000000      /* 48 MHz for SD Cards */
+#endif
+
+#ifdef SD_MMC_DRIVE
+static unsigned char mmc_ext_csd[SD_BLOCK_SIZE] CACHEALIGN_ATTR;
+
+/* MMC high-capacity initialization in legacy four-bit SDR mode. */
+#define MMC_SEND_OP_COND          1
+#define MMC_SEND_EXT_CSD          8
+#define MMC_OCR_ARG               0x40ff8000
+#define MMC_RCA                   (1u << 16)
+#define MMC_SWITCH_BUS_WIDTH_ARG  0x03b70101
+#define MMC_EXT_CSD_SEC_COUNT     212
+#endif
 
 /* Proprietary commands, illegal/reserved according to SD Specification 2.00 */
     /* class 1 */
@@ -247,6 +347,25 @@ static int sd_unpack_r3(struct sd_request *request, struct sd_response_r3 *r3)
     return SD_NO_ERROR;
 }
 
+static void jz_sd_controller_clock(const int drive, bool on)
+{
+#ifdef SD_KEEP_CONTROLLER_CLOCK
+    if (!on && SD_KEEP_CONTROLLER_CLOCK(drive))
+        return;
+#endif
+    switch (MSC_CHN(drive)) {
+    case 0:
+        if (on) __cpm_start_msc0(); else __cpm_stop_msc0();
+        break;
+    case 1:
+        if (on) __cpm_start_msc1(); else __cpm_stop_msc1();
+        break;
+    default:
+        if (on) __cpm_start_msc2(); else __cpm_stop_msc2();
+        break;
+    }
+}
+
 /* Stop the MMC clock and wait while it happens */
 static inline int jz_sd_stop_clock(const int drive)
 {
@@ -254,7 +373,7 @@ static inline int jz_sd_stop_clock(const int drive)
 
     //DEBUG("stop MMC clock");
 #if SD_AUTO_CLOCK
-    REG_MSC_LPM(drive) = 0; /* disable auto clock stop */
+    REG_MSC_LPM(MSC_CHN(drive)) = 0; /* disable auto clock stop */
 #endif
 
     /* only stop if necessary */
@@ -307,6 +426,14 @@ static int jz_sd_check_status(const int drive, struct sd_request *request)
         (MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR |
          MSC_STAT_CRC_RES_ERR))
     {
+#ifdef SD_MMC_R2_CRC_QUIRK
+        /* Some MMC controllers falsely flag CID/CSD response CRC. Limit
+         * the workaround to R2; retain all data and other response checks. */
+        if (SD_MMC_DRIVE(drive) && request->rtype == RESPONSE_R2 &&
+            (status & (MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR |
+                       MSC_STAT_CRC_RES_ERR)) == MSC_STAT_CRC_RES_ERR)
+            return SD_NO_ERROR;
+#endif
         logf("SD CRC error, MSC_STAT 0x%x", status);
         return SD_ERROR_CRC;
     }
@@ -378,7 +505,17 @@ static void jz_sd_get_response(const int drive, struct sd_request *request)
 }
 
 #if SD_DMA_ENABLE
+static bool jz_sd_use_dma(const struct sd_request *req)
+{
+    return ((unsigned long)req->buffer & 0x3) == 0 && req->cnt >= 512 &&
+           (req->cnt & 63) == 0;
+}
+
 static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req);
+#ifdef JZ4760_DMA_DES8
+static void jz_sd_receive_data_dma_start(const int drive,
+                                         struct sd_request *req);
+#endif
 static int jz_sd_receive_data_dma(const int drive, struct sd_request *req);
 #endif
 
@@ -393,7 +530,7 @@ static int jz_sd_receive_data(const int drive, struct sd_request *req)
 
 #if SD_DMA_ENABLE
     /* Use DMA if we can */
-    if ((int)req->buffer & 0x3 == 0 && req->cnt >= 512)
+    if (jz_sd_use_dma(req))
         return jz_sd_receive_data_dma(drive, req);
 #endif
 
@@ -456,7 +593,7 @@ static int jz_sd_transmit_data(const int drive, struct sd_request *req)
 
 #if SD_DMA_ENABLE
     /* Use DMA if we can */
-    if ((int)req->buffer & 0x3 == 0 && req->cnt >= 512)
+    if (jz_sd_use_dma(req))
         return jz_sd_transmit_data_dma(drive, req);
 #endif
 
@@ -508,6 +645,165 @@ static int jz_sd_transmit_data(const int drive, struct sd_request *req)
 }
 
 #if SD_DMA_ENABLE
+#ifdef JZ4760_DMA_DES8
+static void jz_sd_receive_data_dma_start(const int drive,
+                                         struct sd_request *req)
+{
+    /* Stock arms read DMA before starting the MSC command. This also keeps
+     * the FIFO from filling while the destination cache is invalidated. */
+    discard_dcache_range(req->buffer, req->cnt);
+
+    /* setup dma channel */
+    jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+    struct jz_dma_desc *desc = &rx_desc[drive];
+    unsigned int count;
+    unsigned int geometry = jz_msc_dma_geometry(req->buffer, req->cnt,
+                                                  &count);
+
+    /* Use one unlinked 8-word descriptor. DMAC0 remains masked at INTC;
+     * Rockbox polls TT and acknowledges the terminal interrupt pending bit. */
+    desc->dcmd = DMAC_DCMD_DAI | DMAC_DCMD_SWDH_32 |
+                 DMAC_DCMD_DWDH_32 | geometry | DMAC_DCMD_TIE;
+    desc->dsadr = PHYSADDR(MSC_RXFIFO(MSC_CHN(drive)));
+    desc->dtadr = PHYSADDR((unsigned long)req->buffer);
+    desc->ddadr = count;
+    desc->dstrd = 0;
+    desc->dreqt = jz_sd_dma_request(drive, false);
+    desc->reserved0 = 0;
+    desc->reserved1 = 0;
+    commit_discard_dcache_range(desc, sizeof(*desc));
+
+    REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) = DMAC_DCCSR_DES8;
+    REG_DMAC_DRSR(DMA_SD_RX_CHANNEL(drive)) = desc->dreqt;
+    REG_DMAC_DDA(DMA_SD_RX_CHANNEL(drive)) = PHYSADDR((unsigned long)desc);
+    REG_DMAC_DMADBSR(DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM) =
+        1u << (DMA_SD_RX_CHANNEL(drive) % HALF_DMA_NUM);
+    REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM) |=
+        DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) |= DMAC_DCCSR_EN;
+}
+
+static int jz_sd_receive_data_dma(const int drive, struct sd_request *req)
+{
+
+    /* wait for dma completion */
+    {
+        long deadline = current_tick + HZ * 5;
+        unsigned int state;
+        do {
+            state = REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive));
+            /* TT is authoritative even if a controller-wide sticky flag was
+             * left by another channel. Channel INV/AR/HLT are actual faults. */
+            if (state & DMAC_DCCSR_TT)
+                break;
+            if (state & (DMAC_DCCSR_INV | DMAC_DCCSR_AR |
+                         DMAC_DCCSR_HLT)) {
+                jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+                return SD_ERROR_DRIVER_FAILURE;
+            }
+            unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+            if (stat & MSC_STAT_TIME_OUT_READ) {
+                jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+                return SD_ERROR_TIMEOUT;
+            }
+            if (stat & MSC_STAT_CRC_READ_ERROR) {
+                jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+                return SD_ERROR_CRC;
+            }
+            yield();
+        } while (TIME_BEFORE(current_tick, deadline));
+
+        if (!(REG_DMAC_DCCSR(DMA_SD_RX_CHANNEL(drive)) & DMAC_DCCSR_TT)) {
+            jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+            return SD_ERROR_TIMEOUT;
+        }
+    }
+
+    /* clear status and disable channel */
+    jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+
+    /* DMA completion only describes the memory transfer. The MSC can still
+     * report a card-side timeout or CRC failure, as the stock driver's data
+     * completion path does. */
+    unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+    if (stat & MSC_STAT_TIME_OUT_READ)
+        return SD_ERROR_TIMEOUT;
+    if (stat & MSC_STAT_CRC_READ_ERROR)
+        return SD_ERROR_CRC;
+
+    /* flush dcache again */
+    discard_dcache_range(req->buffer, req->cnt);
+
+    return SD_NO_ERROR;
+}
+
+static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req)
+{
+    /* flush dcache */
+    commit_discard_dcache_range(req->buffer, req->cnt);
+
+    /* setup dma channel */
+    jz_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+    struct jz_dma_desc *desc = &tx_desc[drive];
+    unsigned int count;
+    unsigned int geometry = jz_msc_dma_geometry(req->buffer, req->cnt,
+                                                  &count);
+
+    desc->dcmd = DMAC_DCMD_SAI | DMAC_DCMD_SWDH_32 |
+                 DMAC_DCMD_DWDH_32 | geometry | DMAC_DCMD_TIE;
+    desc->dsadr = PHYSADDR((unsigned long)req->buffer);
+    desc->dtadr = PHYSADDR(MSC_TXFIFO(MSC_CHN(drive)));
+    desc->ddadr = count;
+    desc->dstrd = 0;
+    desc->dreqt = jz_sd_dma_request(drive, true);
+    desc->reserved0 = 0;
+    desc->reserved1 = 0;
+    commit_discard_dcache_range(desc, sizeof(*desc));
+
+    REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) = DMAC_DCCSR_DES8;
+    REG_DMAC_DRSR(DMA_SD_TX_CHANNEL(drive)) = desc->dreqt;
+    REG_DMAC_DDA(DMA_SD_TX_CHANNEL(drive)) = PHYSADDR((unsigned long)desc);
+    REG_DMAC_DMADBSR(DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM) =
+        1u << (DMA_SD_TX_CHANNEL(drive) % HALF_DMA_NUM);
+    REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM) |=
+        DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) |= DMAC_DCCSR_EN;
+
+    /* wait for dma completion */
+    {
+        long deadline = current_tick + HZ * 5;
+        unsigned int state;
+        do {
+            state = REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive));
+            if (state & DMAC_DCCSR_TT)
+                break;
+            if (state & (DMAC_DCCSR_INV | DMAC_DCCSR_AR |
+                         DMAC_DCCSR_HLT)) {
+                jz_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+                return SD_ERROR_DRIVER_FAILURE;
+            }
+            yield();
+        } while (TIME_BEFORE(current_tick, deadline));
+
+        if (!(REG_DMAC_DCCSR(DMA_SD_TX_CHANNEL(drive)) & DMAC_DCCSR_TT)) {
+            jz_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+            return SD_ERROR_TIMEOUT;
+        }
+    }
+
+    /* clear status and disable channel */
+    jz_msc_dma_stop(DMA_SD_TX_CHANNEL(drive));
+
+    unsigned int stat = REG_MSC_STAT(MSC_CHN(drive));
+    if (stat & MSC_STAT_TIME_OUT_READ)
+        return SD_ERROR_TIMEOUT;
+    if (stat & (MSC_STAT_CRC_WRITE_ERROR |
+                MSC_STAT_CRC_WRITE_ERROR_NOSTS))
+        return SD_ERROR_CRC;
+
+    return SD_NO_ERROR;
+}
+#else
 static int jz_sd_receive_data_dma(const int drive, struct sd_request *req)
 {
     /* flush dcache */
@@ -578,6 +874,7 @@ static int jz_sd_transmit_data_dma(const int drive, struct sd_request *req)
 
     return SD_NO_ERROR;
 }
+#endif
 
 #if SD_DMA_INTERRUPT
 void DMA_CALLBACK(DMA_SD_RX_CHANNEL0)(void)
@@ -677,7 +974,8 @@ void DMA_CALLBACK(DMA_SD_TX_CHANNEL1)(void)
 static inline unsigned int jz_sd_calc_clkrt(const int drive, unsigned int rate)
 {
     unsigned int clkrt = 0;
-    unsigned int clk_src = cpu_frequency / __cpm_get_mscdiv(); /* MSC_CLK */
+    /* MSCCDR encodes divisor-minus-one and selects the parent PLL. */
+    unsigned int clk_src = __cpm_get_mscclk();
 
     if (!card[drive].sd2plus && rate > SD_CLOCK_FAST)
         rate = SD_CLOCK_FAST;
@@ -709,12 +1007,21 @@ static void jz_sd_set_clock(const int drive, unsigned int rate)
 ********************************************************************************************************************/
 static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 {
+#ifdef JZ4760_DMA_DES8
+    /* Use 16-word FIFO thresholds for descriptor DMA bursts. */
+    unsigned int cmdat = MSC_CMDAT_RTRG_EQUALT_16 |
+                         MSC_CMDAT_TTRG_LESS_16;
+#else
     unsigned int cmdat = 0;
+#endif
     int retval;
 #if !SD_INTERRUPT
     long deadline = current_tick + (HZ * 5);
 #endif
     bool has_data = (request->buffer != NULL);
+#if SD_DMA_ENABLE && defined(JZ4760_DMA_DES8)
+    bool rx_dma_armed = false;
+#endif
 
     /* Indicate we have no result yet */
     request->result = SD_NO_RESPONSE;
@@ -727,10 +1034,9 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
     /* Generic handling for all requests with data rx/tx */
     if (has_data) {
         cmdat |= MSC_CMDAT_DATA_EN;
-//            if (request->nob > 1 && use_sbc[drive])
-//                cmdat |= MSC_CMDAT_SEND_AS_STOP;
 #if SD_DMA_ENABLE
-        if (request->cnt >= 512)
+        /* Keep the controller's DMA mode in lockstep with the software path. */
+        if (jz_sd_use_dma(request))
             cmdat |= MSC_CMDAT_DMA_EN;
 #endif
     }
@@ -764,19 +1070,35 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
         case SD_SEND_SCR:
         case SD_READ_DAT_UNTIL_STOP:
         case SD_READ_SINGLE_BLOCK:
+#ifndef JZ4760_DMA_DES8
         case SD_READ_MULTIPLE_BLOCK:
+#endif
         case SD_SWITCH_FUNC:
             /* These READ data */
             break;
 
+#ifdef JZ4760_DMA_DES8
+        case SD_READ_MULTIPLE_BLOCK:
+            cmdat |= MSC_CMDAT_SEND_AS_STOP;
+            break;
+#endif
+
         case SD_WRITE_DAT_UNTIL_STOP:
         case SD_WRITE_BLOCK:
+#ifndef JZ4760_DMA_DES8
         case SD_WRITE_MULTIPLE_BLOCK:
+#endif
         case SD_PROGRAM_CID:
         case SD_PROGRAM_CSD:
                 /* These WRITE data */
             cmdat |= MSC_CMDAT_WRITE;
             break;
+
+#ifdef JZ4760_DMA_DES8
+        case SD_WRITE_MULTIPLE_BLOCK:
+            cmdat |= MSC_CMDAT_SEND_AS_STOP | MSC_CMDAT_WRITE;
+            break;
+#endif
 
 //        case SD_LOCK_UNLOCK:  // can be a read or write, needs busy too.
 
@@ -844,6 +1166,19 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
     DEBUG("%d Send cmd %d cmdat: %x arg: %x resp %d", drive, request->cmd,
           cmdat, request->arg, request->rtype);
 
+#ifdef JZ4760_DMA_DES8
+    /* Stock reloads the response timeout for every command. */
+    REG_MSC_RESTO(MSC_CHN(drive)) = 0xff;
+#endif
+
+#if SD_DMA_ENABLE && defined(JZ4760_DMA_DES8)
+    /* Arm read DMA before launching MSC; arm write DMA after its response. */
+    if (has_data && !(cmdat & MSC_CMDAT_WRITE) && jz_sd_use_dma(request)) {
+        jz_sd_receive_data_dma_start(drive, request);
+        rx_dma_armed = true;
+    }
+#endif
+
     /* Start SD clock and send command to card */
     jz_sd_start_clock(drive);
 
@@ -851,21 +1186,39 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 #if SD_INTERRUPT
     semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
+#ifdef JZ4760_DMA_DES8
+    /* Stock waits on the controller status, including terminal error bits;
+     * IREG is an interrupt latch and is not its command-completion source. */
+    while (!(REG_MSC_STAT(MSC_CHN(drive)) &
+             (MSC_STAT_END_CMD_RES | MSC_STAT_TIME_OUT_RES |
+              MSC_STAT_CRC_RES_ERR)))
+#else
     while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_END_CMD_RES))
+#endif
     {
-        if (TIME_AFTER(current_tick, deadline))
+        if (TIME_AFTER(current_tick, deadline)) {
+#if SD_DMA_ENABLE && defined(JZ4760_DMA_DES8)
+            if (rx_dma_armed)
+                jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#endif
             return SD_ERROR_TIMEOUT;
+        }
         yield();
     }
 #endif
 
     /* Check for status */
     retval = jz_sd_check_status(drive, request);
-#if SD_INTERRUPT
+#if SD_INTERRUPT || defined(JZ4760_DMA_DES8)
     REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_END_CMD_RES;    /* clear flag */
 #endif
-    if (retval)
+    if (retval) {
+#if SD_DMA_ENABLE && defined(JZ4760_DMA_DES8)
+        if (rx_dma_armed)
+            jz_msc_dma_stop(DMA_SD_RX_CHANNEL(drive));
+#endif
         return retval;
+    }
 
     /* Complete command with no response */
     if (request->rtype == RESPONSE_NONE)
@@ -888,10 +1241,44 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
         semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
         /* Wait for Data Done */
+#ifdef JZ4760_DMA_DES8
+        deadline = current_tick + (HZ * 5);
+        /* Stock's synchronous path verifies DATA_TRAN_DONE in STAT. IREG is
+         * only the latch cleared after the terminal controller state. */
+        while (!(REG_MSC_STAT(MSC_CHN(drive)) & MSC_STAT_DATA_TRAN_DONE)) {
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            if (TIME_AFTER(current_tick, deadline))
+                return SD_ERROR_TIMEOUT;
+            yield();
+        }
+#else
         while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_DATA_TRAN_DONE))
             yield();
+#endif
         REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_DATA_TRAN_DONE;    /* clear status */
 #endif
+
+#ifdef JZ4760_DMA_DES8
+        if (cmdat & MSC_CMDAT_SEND_AS_STOP) {
+            deadline = current_tick + (HZ * 5);
+            while (!(REG_MSC_STAT(MSC_CHN(drive)) &
+                     (MSC_STAT_AUTO_CMD_DONE | MSC_STAT_TIME_OUT_READ |
+                      MSC_STAT_CRC_READ_ERROR | MSC_STAT_CRC_WRITE_ERROR))) {
+                if (TIME_AFTER(current_tick, deadline))
+                    return SD_ERROR_TIMEOUT;
+                yield();
+            }
+
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_AUTO_CMD_DONE;
+            REG_MSC_CMDAT(MSC_CHN(drive)) &= ~MSC_CMDAT_SEND_AS_STOP;
+        }
+#endif
+
     }
 
     /* Wait for Prog Done event if necessary */
@@ -900,8 +1287,20 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 #if SD_INTERRUPT
         semaphore_wait(&sd_wakeup[drive], HZ * 5);
 #else
+#ifdef JZ4760_DMA_DES8
+        deadline = current_tick + (HZ * 5);
+        while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_PRG_DONE)) {
+            retval = jz_sd_check_status(drive, request);
+            if (retval)
+                return retval;
+            if (TIME_AFTER(current_tick, deadline))
+                return SD_ERROR_TIMEOUT;
+            yield();
+        }
+#else
         while (!(REG_MSC_IREG(MSC_CHN(drive)) & MSC_IREG_PRG_DONE))
             yield();
+#endif
         REG_MSC_IREG(MSC_CHN(drive)) = MSC_IREG_PRG_DONE;    /* clear status */
 #endif
     }
@@ -922,7 +1321,11 @@ static int jz_sd_exec_cmd(const int drive, struct sd_request *request)
 ********************************************************************************************************************/
 static int jz_sd_chkcard(const int drive)
 {
+#ifdef SD_CARD_PRESENT
+    return SD_CARD_PRESENT(drive);
+#else
     return (__gpio_get_pin((drive == SD_SLOT_1) ? PIN_SD1_CD : PIN_SD2_CD) == 0 ? 1 : 0);
+#endif
 }
 
 /* MSC interrupt handlers */
@@ -967,6 +1370,9 @@ void MSC1(void) /* SD_SLOT_2 */
 #ifdef HAVE_HOTSWAP
 static void sd_gpio_setup_irq(const int drive, bool inserted)
 {
+#ifdef SD_GPIO_SETUP_IRQ
+    SD_GPIO_SETUP_IRQ(drive, inserted);
+#else
     int pin = (drive == SD_SLOT_1) ? PIN_SD1_CD : PIN_SD2_CD;
     int irq = (drive == SD_SLOT_1) ? IRQ_SD1_CD : IRQ_SD2_CD;
     if(inserted)
@@ -974,6 +1380,7 @@ static void sd_gpio_setup_irq(const int drive, bool inserted)
     else
         __gpio_as_irq_fall_edge(pin);
     system_enable_irq(irq);
+#endif
 }
 #endif
 
@@ -985,22 +1392,27 @@ static void sd_gpio_setup_irq(const int drive, bool inserted)
 ********************************************************************************************************************/
 static void jz_sd_hardware_init(const int drive)
 {
-    if (drive == SD_SLOT_1)
-        __cpm_start_msc2();   /* enable mmc2 clock */
-    else
-        __cpm_start_msc1();   /* enable mmc1 clock */
+    const int channel = MSC_CHN(drive);
+    jz_sd_controller_clock(drive, true);
 #ifdef HAVE_HOTSWAP
     sd_gpio_setup_irq(drive, jz_sd_chkcard(drive));
 #endif
-    __msc_reset(MSC_CHN(drive));  /* reset mmc/sd controller */
-    SD_IRQ_MASK(MSC_CHN(drive));  /* mask all IRQs */
+    __msc_reset(channel);
+    SD_IRQ_MASK(channel);
 #if SD_AUTO_CLOCK
-    REG_MSC_STRPCL(MSC_CHN(drive)) = MSC_STRPCL_CLOCK_CONTROL_START; /* Enable clocks */
-    REG_MSC_LPM(drive) = MSC_SET_LPM; /* enable auto clock stop */
-#else
-    jz_sd_stop_clock(drive); /* stop SD clock */
+#ifndef JZ4760_DMA_DES8
+    REG_MSC_STRPCL(channel) = MSC_STRPCL_CLOCK_CONTROL_START;
 #endif
-    jz_sd_set_clock(drive, MMC_CLOCK_SLOW); /* Drop to lowest speed */
+    REG_MSC_LPM(channel) = MSC_SET_LPM;
+#else
+    jz_sd_stop_clock(drive);
+#endif
+#ifdef JZ4760_DMA_DES8
+    /* Descriptor requests rely on explicit controller timeout defaults. */
+    REG_MSC_RDTO(channel) = 0xffffffff;
+    REG_MSC_RESTO(channel) = 0xff;
+#endif
+    jz_sd_set_clock(drive, MMC_CLOCK_SLOW);
 }
 
 static void sd_send_cmd(const int drive, struct sd_request *request, int cmd, unsigned int arg,
@@ -1030,9 +1442,118 @@ static void sd_simple_cmd(const int drive, struct sd_request *request, int cmd, 
     sd_send_cmd(drive, request, cmd, arg, 0, 0, rtype, NULL);
 }
 
+#ifdef SD_VALIDATE_CARD
+static int sd_read_mbr(int drive, unsigned char *buffer)
+{
+    struct sd_request request = {0};
+    struct sd_response_r1 r1;
+    sd_send_cmd(drive, &request, SD_READ_SINGLE_BLOCK, 0, 1,
+                SD_BLOCK_SIZE, RESPONSE_R1, buffer);
+    return sd_unpack_r1(&request, &r1);
+}
+#endif
+
+#ifdef SD_MMC_DRIVE
+static int jz_mmc_init_card(const int drive)
+{
+    struct sd_request request = {0};
+    struct sd_response_r1 r1;
+    struct sd_response_r3 r3;
+    long deadline;
+    int retval;
+
+    sd_simple_cmd(drive, &request, SD_GO_IDLE_STATE, 0, RESPONSE_NONE);
+
+    deadline = current_tick + HZ;
+    do {
+        sd_simple_cmd(drive, &request, MMC_SEND_OP_COND,
+                      MMC_OCR_ARG, RESPONSE_R3);
+        retval = sd_unpack_r3(&request, &r3);
+        if (retval)
+            return retval;
+
+        card[drive].ocr = r3.ocr;
+        if (r3.ocr & SD_CARD_BUSY)
+            break;
+
+        sleep(HZ / 100);
+    } while (TIME_BEFORE(current_tick, deadline));
+
+    if (!(card[drive].ocr & SD_CARD_BUSY))
+        return SD_ERROR_TIMEOUT;
+
+    sd_simple_cmd(drive, &request, SD_ALL_SEND_CID, 0, RESPONSE_R2);
+    if (request.result)
+        return request.result;
+    for (int i = 0; i < 4; i++)
+        card[drive].cid[i] = PARSE_U32(request.response, 1 + i * 4);
+
+    card[drive].rca = MMC_RCA;
+    sd_simple_cmd(drive, &request, SD_SEND_RELATIVE_ADDR,
+                  card[drive].rca, RESPONSE_R1);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    sd_simple_cmd(drive, &request, SD_SEND_CSD,
+                  card[drive].rca, RESPONSE_R2);
+    if (request.result)
+        return request.result;
+    for (int i = 0; i < 4; i++)
+        card[drive].csd[i] = PARSE_U32(request.response, 1 + i * 4);
+
+    sd_simple_cmd(drive, &request, SD_SELECT_CARD,
+                  card[drive].rca, RESPONSE_R1B);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    /* MMC SWITCH: EXT_CSD BUS_WIDTH=1 selects four data lines. */
+    sd_simple_cmd(drive, &request, SD_SWITCH_FUNC,
+                  MMC_SWITCH_BUS_WIDTH_ARG, RESPONSE_R1B);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+    use_4bit[drive] = 2;
+
+    memset(mmc_ext_csd, 0, sizeof(mmc_ext_csd));
+    sd_send_cmd(drive, &request, MMC_SEND_EXT_CSD, 0, 1,
+                sizeof(mmc_ext_csd), RESPONSE_R1,
+                mmc_ext_csd);
+    retval = sd_unpack_r1(&request, &r1);
+    if (retval)
+        return retval;
+
+    card[drive].numblocks =
+        (sector_t)mmc_ext_csd[MMC_EXT_CSD_SEC_COUNT] |
+        ((sector_t)mmc_ext_csd[MMC_EXT_CSD_SEC_COUNT + 1] << 8) |
+        ((sector_t)mmc_ext_csd[MMC_EXT_CSD_SEC_COUNT + 2] << 16) |
+        ((sector_t)mmc_ext_csd[MMC_EXT_CSD_SEC_COUNT + 3] << 24);
+    if (card[drive].numblocks == 0)
+        return SD_ERROR_DRIVER_FAILURE;
+
+    card[drive].blocksize = SD_BLOCK_SIZE;
+    /* The shared transfer path uses sd2plus to select sector addressing.
+     * EXT_CSD SEC_COUNT eMMC devices use the same 512-byte sector argument. */
+    card[drive].sd2plus = 1;
+    jz_sd_set_clock(drive, SD_CLOCK_FAST);
+
+#ifdef SD_VALIDATE_CARD
+    retval = SD_VALIDATE_CARD(drive, card[drive].numblocks, sd_read_mbr);
+    if (retval)
+        return retval;
+#endif
+    card[drive].initialized = 1;
+
+    logf("eMMC ready: %lu sectors",
+         (unsigned long)card[drive].numblocks);
+    return SD_NO_ERROR;
+}
+#endif
+
 static int sd_exec_acmd(const int drive, struct sd_request *request, int cmd, unsigned int arg)
 {
-    struct sd_response_r1 r1;
+    struct sd_response_r1 r1 = {0};
     int retval;
 
     sd_simple_cmd(drive, request, SD_APP_CMD, card[drive].rca, RESPONSE_R1);
@@ -1236,7 +1757,7 @@ static int sd_switch_hs(const int drive, struct sd_request *request)
 
 static int sd_select_card(const int drive)
 {
-    struct sd_request request;
+    struct sd_request request = {0};
     struct sd_response_r1 r1;
     int retval;
 
@@ -1276,7 +1797,7 @@ static int sd_select_card(const int drive)
 
 static inline bool card_detect_target(const int drive)
 {
-    return (jz_sd_chkcard(drive) == 1);
+    return jz_sd_chkcard(drive) != 0;
 }
 
 static int __sd_init_device(const int drive)
@@ -1292,12 +1813,30 @@ static int __sd_init_device(const int drive)
     use_sbc[drive] = 0;
     active[drive] = 0;
 
+#ifdef SD_PRE_INIT
+    SD_PRE_INIT(drive);
+#endif
+
     /* reset mmc/sd controller */
     jz_sd_hardware_init(drive);
 
     /* Don't bother if card isn't present */
-    if (!card_detect_target(drive))
+    if (!card_detect_target(drive)) {
         return 0;
+    }
+
+#ifdef SD_MMC_DRIVE
+    if (SD_MMC_DRIVE(drive)) {
+        retval = jz_mmc_init_card(drive);
+        jz_sd_controller_clock(drive, false);
+        return retval;
+    }
+#endif
+
+#ifdef JZ4760_DMA_DES8
+    /* Stock U-Boot stops any inherited transfer before CMD0. */
+    sd_simple_cmd(drive, &init_req, SD_STOP_TRANSMISSION, 0, RESPONSE_R1B);
+#endif
 
     sd_simple_cmd(drive, &init_req, SD_GO_IDLE_STATE, 0,     RESPONSE_NONE);
 
@@ -1310,10 +1849,7 @@ static int __sd_init_device(const int drive)
 
     retval = (retval == SD_INIT_PASSED ? sd_select_card(drive) : -1);
 
-    if (drive == SD_SLOT_1)
-        __cpm_stop_msc2(); /* disable SD1 clock */
-    else
-        __cpm_stop_msc1(); /* disable SD2 clock */
+    jz_sd_controller_clock(drive, false);
 
     return retval;
 }
@@ -1325,15 +1861,33 @@ int sd_init(void)
     sd_init_gpio();     /* init GPIO */
 
 #if SD_DMA_ENABLE
+#ifdef JZ4760_DMAC_LEGACY_CLOCK_GATES
+    /* Original JZ4760 programs DMACKE directly; B adds SET/CLEAR aliases. */
+    for (int controller = 0; controller < 2; ++controller) {
+        unsigned int mask = 0;
+        for (int drive = 0; drive < NUM_DRIVES; ++drive) {
+            int rx = DMA_SD_RX_CHANNEL(drive), tx = DMA_SD_TX_CHANNEL(drive);
+            if (rx / HALF_DMA_NUM == controller)
+                mask |= 1u << (rx % HALF_DMA_NUM);
+            if (tx / HALF_DMA_NUM == controller)
+                mask |= 1u << (tx % HALF_DMA_NUM);
+        }
+        if (mask)
+            REG_DMAC_DMACKE(controller) = mask;
+    }
+#else
     __dmac_channel_enable_clk(DMA_SD_RX_CHANNEL(SD_SLOT_1));
     __dmac_channel_enable_clk(DMA_SD_RX_CHANNEL(SD_SLOT_2));
     __dmac_channel_enable_clk(DMA_SD_TX_CHANNEL(SD_SLOT_1));
     __dmac_channel_enable_clk(DMA_SD_TX_CHANNEL(SD_SLOT_2));
 #endif
+#endif
 
     if(!inited)
     {
-        __cpm_stop_msc0();   /* We don't use MSC0 */
+#ifndef SD_MMC_DRIVE
+        __cpm_stop_msc0();
+#endif
 
 #if SD_DMA_INTERRUPT || SD_INTERRUPT
         semaphore_init(&sd_wakeup[SD_SLOT_1], 1, 0);
@@ -1374,10 +1928,7 @@ tCardInfo* card_get_info_target(const int drive)
 static inline void sd_start_transfer(const int drive)
 {
     mutex_lock(&sd_mtx[drive]);
-    if (drive == SD_SLOT_1)
-        __cpm_start_msc2();
-    else
-        __cpm_start_msc1();
+    jz_sd_controller_clock(drive, true);
 
     active[drive] = 1;
     led(active[SD_SLOT_1] || active[SD_SLOT_2]);
@@ -1388,28 +1939,35 @@ static inline void sd_stop_transfer(const int drive)
     active[drive] = 0;
     led(active[SD_SLOT_1] || active[SD_SLOT_2]);
 
-    if (drive == SD_SLOT_1)
-        __cpm_stop_msc2();
-    else
-        __cpm_stop_msc1();
+    jz_sd_controller_clock(drive, false);
     mutex_unlock(&sd_mtx[drive]);
 }
 
 int sd_transfer_sectors(IF_MD(const int drive,) sector_t start, int count, void* buf, bool write)
 {
-    struct sd_request request;
+    struct sd_request request = {0};
     struct sd_response_r1 r1;
     int retval = -1;
 #ifndef HAVE_MULTIDRIVE
     const int drive = 0;
 #endif
 
+#ifdef SD_WRITE_ALLOWED
+    if (write && !SD_WRITE_ALLOWED(drive, start, count))
+        return -1;
+#endif
+
     sd_start_transfer(drive);
 
-    if (!card_detect_target(drive) || count < 1 || (start + count) > card[drive].numblocks)
+    if (!card_detect_target(drive) || count < 1)
         goto err;
 
-    if(card[drive].initialized == 0 && !__sd_init_device(drive))
+    /* Initialization returns zero on success and populates numblocks. */
+    if (card[drive].initialized == 0 && __sd_init_device(drive))
+        goto err;
+
+    if (start >= card[drive].numblocks ||
+        (sector_t)count > card[drive].numblocks - start)
         goto err;
 
     sd_simple_cmd(drive, &request, SD_SEND_STATUS, card[drive].rca, RESPONSE_R1);
@@ -1444,9 +2002,24 @@ int sd_transfer_sectors(IF_MD(const int drive,) sector_t start, int count, void*
                 count, SD_BLOCK_SIZE, RESPONSE_R1, buf);
     retval = sd_unpack_r1(&request, &r1);
 
+#ifdef JZ4760_DMA_DES8
+    /* Successful multiblock requests are terminated by the MSC controller's
+     * stop command. A failed transfer still falls back to an explicit CMD12
+     * below, exactly like the stock driver's error path. */
+    if (retval) {
+#else
     if (retval || (!use_sbc[drive] && count > 1)) {
+#endif
+#ifdef JZ4760_DMA_DES8
+        int transfer_retval = retval;
+#endif
         sd_simple_cmd(drive, &request, SD_STOP_TRANSMISSION, 0, RESPONSE_R1B);
         retval = sd_unpack_r1(&request, &r1);
+#ifdef JZ4760_DMA_DES8
+        if (transfer_retval)
+            retval = transfer_retval;
+        else
+#endif
         if (!write && retval == SD_ERROR_OUT_OF_RANGE)
             retval = 0;
     }
@@ -1485,6 +2058,11 @@ void sd_enable(bool on)
 
 bool sd_disk_is_active(void)
 {
+    for (int drive = 0; drive < NUM_DRIVES; drive++) {
+        if (active[drive])
+            return true;
+    }
+
     return false;
 }
 
@@ -1496,10 +2074,14 @@ int sd_soft_reset(void)
 #ifdef HAVE_HOTSWAP
 bool sd_removable(IF_MD_NONVOID(const int drive))
 {
+#ifdef SD_CARD_REMOVABLE
+    return SD_CARD_REMOVABLE(drive);
+#else
 #ifdef HAVE_MULTIDRIVE
      (void)drive;
 #endif
     return true;
+#endif
 }
 
 static int sd_oneshot_callback(struct timeout *tmo)
@@ -1518,11 +2100,13 @@ static int sd_oneshot_callback(struct timeout *tmo)
 }
 
 /* called on insertion/removal interrupt */
+#ifdef GPIO_SD1_CD
 void GPIO_SD1_CD(void)
 {
     static struct timeout sd1_oneshot;
     timeout_register(&sd1_oneshot, sd_oneshot_callback, (3*HZ/10), SD_SLOT_1);
 }
+#endif
 
 void GPIO_SD2_CD(void)
 {
