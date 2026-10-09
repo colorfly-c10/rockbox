@@ -534,6 +534,18 @@
 #define FLIPIT_STEP_BY_STEP BUTTON_X
 #define FLIPIT_TOGGLE       BUTTON_A
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+
+#define FLIPIT_LEFT         BUTTON_LEFT
+#define FLIPIT_RIGHT        BUTTON_RIGHT
+#define FLIPIT_UP           BUTTON_UP
+#define FLIPIT_DOWN         BUTTON_DOWN
+#define FLIPIT_QUIT         BUTTON_HOME
+#define FLIPIT_SHUFFLE      (BUTTON_PLAY | BUTTON_LEFT)
+#define FLIPIT_SOLVE        (BUTTON_PLAY | BUTTON_RIGHT)
+#define FLIPIT_STEP_BY_STEP (BUTTON_PLAY | BUTTON_DOWN)
+#define FLIPIT_TOGGLE       BUTTON_PLAY
+
 #else
 #error No keymap defined!
 #endif

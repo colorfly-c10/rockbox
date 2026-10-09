@@ -269,6 +269,11 @@ struct battery_tables_t {
 #define BATTERY_OFF     BUTTON_SELECT
 #define BATTERY_ON_TXT  "Start"
 #define BATTERY_OFF_TXT "Select"
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define BATTERY_ON      BUTTON_PLAY
+#define BATTERY_OFF     BUTTON_HOME
+#define BATTERY_ON_TXT  "PLAY - start"
+#define BATTERY_OFF_TXT "BACK"
 
 #else
 #error "No keymap defined!"

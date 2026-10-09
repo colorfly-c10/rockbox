@@ -506,6 +506,18 @@ static void setoptions (void)
         options.SELECT = BUTTON_SELECT;
         options.MENU   = BUTTON_POWER;
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+        options.UP     = BUTTON_UP;
+        options.DOWN   = BUTTON_DOWN;
+        options.LEFT   = BUTTON_LEFT;
+        options.RIGHT  = BUTTON_RIGHT;
+
+        options.A      = BUTTON_PLAY;
+        options.B      = BUTTON_HOME;
+        options.START  = (BUTTON_PLAY | BUTTON_REPEAT);
+        options.SELECT = (BUTTON_HOME | BUTTON_REPEAT);
+        options.MENU   = BUTTON_POWER;
+
 #else
 #error No Keymap Defined!
 #endif

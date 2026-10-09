@@ -489,6 +489,16 @@
 #define LABEL_QUIT   "Power"
 #define LABEL_MENU   "Start"
 #define LABEL_VOLUME "Up/Down"
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define VUMETER_QUIT BUTTON_HOME
+#define VUMETER_HELP BUTTON_LEFT
+#define VUMETER_MENU BUTTON_PLAY
+#define VUMETER_UP   BUTTON_UP
+#define VUMETER_DOWN BUTTON_DOWN
+#define LABEL_HELP   "LEFT"
+#define LABEL_QUIT   "BACK"
+#define LABEL_MENU   "PLAY"
+#define LABEL_VOLUME "UP/DOWN"
 
 #else
 #error No keymap defined!

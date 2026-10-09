@@ -194,6 +194,15 @@ const struct button_mapping pla_main_ctx[] =
     { PLA_DOWN_REPEAT,       BUTTON_FF|BUTTON_REPEAT,           BUTTON_NONE},
     { PLA_LEFT_REPEAT,       BUTTON_REW|BUTTON_M|BUTTON_REPEAT, BUTTON_NONE},
     { PLA_RIGHT_REPEAT,      BUTTON_FF|BUTTON_M|BUTTON_REPEAT,  BUTTON_NONE},
+#elif (CONFIG_KEYPAD == COLORFLY_C10_PAD)
+    { PLA_UP,               BUTTON_UP,                          BUTTON_NONE },
+    { PLA_DOWN,             BUTTON_DOWN,                        BUTTON_NONE },
+    { PLA_LEFT,             BUTTON_LEFT,                        BUTTON_NONE },
+    { PLA_RIGHT,            BUTTON_RIGHT,                       BUTTON_NONE },
+    { PLA_UP_REPEAT,        BUTTON_UP|BUTTON_REPEAT,            BUTTON_NONE },
+    { PLA_DOWN_REPEAT,      BUTTON_DOWN|BUTTON_REPEAT,          BUTTON_NONE },
+    { PLA_LEFT_REPEAT,      BUTTON_LEFT|BUTTON_REPEAT,          BUTTON_NONE },
+    { PLA_RIGHT_REPEAT,     BUTTON_RIGHT|BUTTON_REPEAT,         BUTTON_NONE },
 #elif (CONFIG_KEYPAD == XDUOO_X3_PAD)
     { PLA_UP,               BUTTON_HOME,                        BUTTON_NONE },
     { PLA_DOWN,             BUTTON_OPTION,                      BUTTON_NONE },
@@ -480,6 +489,12 @@ const struct button_mapping pla_main_ctx[] =
     {PLA_EXIT,              BUTTON_POWER|BUTTON_REL,            BUTTON_NONE},
     {PLA_SELECT,            BUTTON_PLAY,                        BUTTON_NONE},
     {PLA_SELECT_REL,        BUTTON_PLAY|BUTTON_REL,             BUTTON_NONE},
+    {PLA_SELECT_REPEAT,     BUTTON_PLAY|BUTTON_REPEAT,          BUTTON_NONE},
+#elif (CONFIG_KEYPAD == COLORFLY_C10_PAD)
+    {PLA_CANCEL,            BUTTON_HOME|BUTTON_REL,             BUTTON_HOME},
+    {PLA_EXIT,              BUTTON_HOME|BUTTON_REPEAT,          BUTTON_NONE},
+    {PLA_SELECT,            BUTTON_PLAY,                        BUTTON_NONE},
+    {PLA_SELECT_REL,        BUTTON_PLAY|BUTTON_REL,             BUTTON_PLAY},
     {PLA_SELECT_REPEAT,     BUTTON_PLAY|BUTTON_REPEAT,          BUTTON_NONE},
 #elif (CONFIG_KEYPAD == XDUOO_X3_PAD)
     {PLA_CANCEL,            BUTTON_POWER|BUTTON_REL,            BUTTON_POWER},

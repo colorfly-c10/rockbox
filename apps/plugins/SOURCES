@@ -143,12 +143,16 @@ spacerocks.c
 
 blackjack.c
 bounce.c
+#if CONFIG_KEYPAD != COLORFLY_C10_PAD /* no 400x360 layout or bitmap set */
 bubbles.c
+#endif
 calculator.c
 chip8.c
 chopper.c
 demystify.c
+#if CONFIG_KEYPAD != COLORFLY_C10_PAD /* no 400x360 bitmap set */
 jewels.c
+#endif
 minesweeper.c
 open_plugins.c
 oscilloscope.c
@@ -201,8 +205,10 @@ matrix.c
 speedread.c
 
 #if (LCD_WIDTH > 138)
+#if CONFIG_KEYPAD != COLORFLY_C10_PAD /* no 400x360 bitmap set */
 invadrox.c
 superdom.c
+#endif
 #endif
 
 #endif /* LCD_DEPTH > 1 */

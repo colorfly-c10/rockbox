@@ -643,6 +643,22 @@ enum {
 #define BJACK_RIGHT         BUTTON_RIGHT
 #define BJACK_LEFT          BUTTON_LEFT
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define BJACK_SELECT_NAME   "PLAY"
+#define BJACK_STAY_NAME     "RIGHT"
+#define BJACK_QUIT_NAME     "BACK"
+#define BJACK_DOUBLE_NAME   "LEFT"
+#define BJACK_SELECT        BUTTON_PLAY
+#define BJACK_QUIT          BUTTON_HOME
+#define BJACK_MAX           (BUTTON_PLAY | BUTTON_UP)
+#define BJACK_MIN           (BUTTON_PLAY | BUTTON_DOWN)
+#define BJACK_STAY          BUTTON_RIGHT
+#define BJACK_DOUBLEDOWN    BUTTON_LEFT
+#define BJACK_UP            BUTTON_UP
+#define BJACK_DOWN          BUTTON_DOWN
+#define BJACK_RIGHT         BUTTON_RIGHT
+#define BJACK_LEFT          BUTTON_LEFT
+
 #else
 #error No keymap defined!
 #endif

@@ -720,6 +720,21 @@
 #define STAR_LEVEL_UP_NAME  "Start"
 #define STAR_LEVEL_DOWN_NAME "Select"
 #define STAR_LEVEL_REPEAT_NAME "X"
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define STAR_QUIT                BUTTON_HOME
+#define STAR_LEFT                BUTTON_LEFT
+#define STAR_RIGHT               BUTTON_RIGHT
+#define STAR_UP                  BUTTON_UP
+#define STAR_DOWN                BUTTON_DOWN
+#define STAR_TOGGLE_CONTROL      BUTTON_PLAY
+#define STAR_LEVEL_UP            (BUTTON_PLAY | BUTTON_RIGHT)
+#define STAR_LEVEL_DOWN          (BUTTON_PLAY | BUTTON_LEFT)
+#define STAR_LEVEL_REPEAT        (BUTTON_PLAY | BUTTON_DOWN)
+#define STAR_TOGGLE_CONTROL_NAME "PLAY"
+#define STAR_QUIT_NAME           "BACK"
+#define STAR_LEVEL_UP_NAME       "PLAY+RIGHT"
+#define STAR_LEVEL_DOWN_NAME     "PLAY+LEFT"
+#define STAR_LEVEL_REPEAT_NAME   "PLAY+DOWN"
 
 #else
 #error No keymap defined!

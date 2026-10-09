@@ -779,6 +779,25 @@ CONFIG_KEYPAD == MROBE500_PAD
 #   define HK_CUR2STACK     "BACK"
 #   define HK_REM2STACK     "MENU+UP"
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#   define SOL_QUIT          (BUTTON_HOME | BUTTON_REL)
+#   define SOL_UP            BUTTON_UP
+#   define SOL_DOWN          BUTTON_DOWN
+#   define SOL_LEFT          BUTTON_LEFT
+#   define SOL_RIGHT         BUTTON_RIGHT
+#   define SOL_MOVE_PRE      BUTTON_PLAY
+#   define SOL_MOVE          (BUTTON_PLAY | BUTTON_REL)
+#   define SOL_DRAW          (BUTTON_HOME | BUTTON_REPEAT)
+#   define SOL_REM2CUR       (BUTTON_PLAY | BUTTON_DOWN)
+#   define SOL_CUR2STACK_PRE BUTTON_PLAY
+#   define SOL_CUR2STACK     (BUTTON_PLAY | BUTTON_REPEAT)
+#   define SOL_REM2STACK     (BUTTON_PLAY | BUTTON_UP)
+#   define HK_MOVE           "PLAY"
+#   define HK_DRAW           "Hold BACK"
+#   define HK_REM2CUR        "PLAY+DOWN"
+#   define HK_CUR2STACK      "Hold PLAY"
+#   define HK_REM2STACK      "PLAY+UP"
+
 
 #elif (CONFIG_KEYPAD == ECHO_R1_PAD)
 #   define SOL_QUIT         BUTTON_POWER

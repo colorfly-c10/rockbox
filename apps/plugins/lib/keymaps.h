@@ -290,6 +290,14 @@
 #define BTN_FIRE        BUTTON_A
 #define BTN_PAUSE       BUTTON_POWER
 
+#elif CONFIG_KEYPAD == COLORFLY_C10_PAD
+#define BTN_UP          BUTTON_UP
+#define BTN_DOWN        BUTTON_DOWN
+#define BTN_LEFT        BUTTON_LEFT
+#define BTN_RIGHT       BUTTON_RIGHT
+#define BTN_FIRE        BUTTON_PLAY
+#define BTN_PAUSE       BUTTON_HOME
+
 #else
 #error Unsupported keypad
 #endif
