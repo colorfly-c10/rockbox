@@ -26,6 +26,9 @@
 #include "system.h"
 #include "kernel.h"
 #include "power.h"
+#ifdef HAVE_JZ4760_SYSTEM_TARGET
+#include "system-board.h"
+#endif
 
 #define HW_UDELAY_TIMER 3
 #ifdef BOOTLOADER
@@ -132,6 +135,19 @@ static unsigned int dma_irq_mask = 0;
 static unsigned char mdma_irq_mask = 0;
 static unsigned char bdma_irq_mask = 0;
 static unsigned int gpio_irq_mask[6] = {0};
+
+/* Demultiplex only the controller whose parent interrupt fired. */
+static int get_dmac_irq(unsigned int controller)
+{
+    unsigned int pending = REG_DMAC_DMAIPR(controller) & 0x3f;
+    unsigned int first = controller * HALF_DMA_NUM;
+
+    for (unsigned int local = 0; local < HALF_DMA_NUM; ++local)
+        if (pending & (1u << local))
+            return first + local;
+
+    return -1;
+}
 
 void system_enable_irq(unsigned int irq)
 {
@@ -246,10 +262,12 @@ static int get_irq_number(void)
     if (UNLIKELY(irq0 < 0) && UNLIKELY(irq1 < 0))
         return -1;
 
-    // Prioritze DMA0 (audio) and TCU0 (systick), then everything on ipl1 (ie MSC mostly)
-    if (ipl0 & 1<<IRQ_DMAC0) {
-        irq = IRQ_DMAC0;
-        ipl0 &= ~(1<<IRQ_DMAC0);
+    /* Prioritize the controller carrying playback, regardless of channel. */
+    const int audio_dma_irq = IRQ_DMAC0 -
+                              DMA_AIC_TX_CHANNEL / HALF_DMA_NUM;
+    if (ipl0 & 1<<audio_dma_irq) {
+        irq = audio_dma_irq;
+        ipl0 &= ~(1<<audio_dma_irq);
     } else if (ipl0 & 1<<IRQ_TCU0) {
         irq = IRQ_TCU0;
         ipl0 &= ~(1<<IRQ_TCU0);
@@ -272,8 +290,14 @@ static int get_irq_number(void)
             irq = __gpio_get_irq() + IRQ_GPIO_0;
             break;
         case IRQ_DMAC0:
+            irq = get_dmac_irq(0);
+            if (irq >= 0)
+                irq += IRQ_DMA_0;
+            break;
         case IRQ_DMAC1:
-            irq = __dmac_get_irq() + IRQ_DMA_0;
+            irq = get_dmac_irq(1);
+            if (irq >= 0)
+                irq += IRQ_DMA_0;
             break;
         case IRQ_MDMA:
             irq = __mdmac_get_irq() + IRQ_MDMA_0;
@@ -568,8 +592,10 @@ static int serial_preinit(void)
 #define cpu_frequency CPU_FREQ
 #endif
 
+#ifndef HAVE_JZ4760_SYSTEM_TARGET
 static void usb_preinit(void)
 {
+
     /* Clear ECS bit of CPCCR, 0:clock source is EXCLK, 1:clock source is EXCLK/2 */
     REG_CPM_CPCCR &= ~CPCCR_ECS;
 
@@ -619,6 +645,7 @@ static void usb_preinit(void)
     /* Wait PHY Clock Stable. */
     udelay(300);
 }
+#endif
 
 static void dma_preinit(void)
 {
@@ -627,11 +654,17 @@ static void dma_preinit(void)
 
     REG_MDMAC_DMACKES = 0x1;
 
-    REG_DMAC_DMACR(DMA_AIC_TX_CHANNEL) = DMAC_DMACR_DMAE | DMAC_DMACR_FAIC;
-    REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(0)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
-    REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(1)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
-    REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(0)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
-    REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(1)) = DMAC_DMACR_DMAE | DMAC_DMACR_FMSC;
+    /* DMACR is indexed by controller (0/1), not global channel (0..11).
+     * Combine policies when audio and storage share a controller. */
+    REG_DMAC_DMACR(0) = DMAC_DMACR_DMAE;
+    REG_DMAC_DMACR(1) = DMAC_DMACR_DMAE;
+#ifndef JZ4760_AIC_EXTERNAL_CLOCK
+    REG_DMAC_DMACR(DMA_AIC_TX_CHANNEL / HALF_DMA_NUM) |= DMAC_DMACR_FAIC;
+#endif
+    for (int drive = 0; drive < NUM_DRIVES; ++drive) {
+        REG_DMAC_DMACR(DMA_SD_RX_CHANNEL(drive) / HALF_DMA_NUM) |= DMAC_DMACR_FMSC;
+        REG_DMAC_DMACR(DMA_SD_TX_CHANNEL(drive) / HALF_DMA_NUM) |= DMAC_DMACR_FMSC;
+    }
 }
 
 /* Gets called *before* main */
@@ -668,7 +701,16 @@ void ICODE_ATTR system_early_init(void)
     REG_DDRC_CTRL = 0;
     REG_DDRC_CTRL = 0;
 
+#ifdef JZ4760_DDRC_CTRL
+    /* Restore persistent controller settings after clearing the FIFO. */
+    REG_DDRC_CTRL = JZ4760_DDRC_CTRL;
+#endif
+
+#ifdef JZ4760_FIXED_PLL
+    pll0_init(CPUFREQ_MAX);
+#else
     pll0_init(CPUFREQ_DEFAULT); // PLL0 drives everything but audio
+#endif
     pll1_disable();             // Leave PLL1 disabled until audio needs it
 
     /* Make sure UARTs are off */
@@ -679,7 +721,11 @@ void ICODE_ATTR system_early_init(void)
     serial_preinit();
 #endif
 
+#ifdef HAVE_JZ4760_SYSTEM_TARGET
+    SYSTEM_USB_PREINIT();
+#else
     usb_preinit();
+#endif
     dma_preinit();
 
     /* Enable interrupts at core level */
@@ -707,6 +753,7 @@ void system_exception_wait(void)
     }
 }
 
+#ifndef HAVE_TARGET_POWER_OFF
 void power_off(void)
 {
     REG_CPM_RSR = 0x0;
@@ -728,6 +775,7 @@ void power_off(void)
 
     while (1);
 }
+#endif /* !HAVE_TARGET_POWER_OFF */
 
 void system_init(void)
 {
@@ -749,7 +797,28 @@ void set_cpu_frequency(long frequency)
    else if (frequency > CPUFREQ_MAX)
        frequency = CPUFREQ_MAX;
 
+#ifdef JZ4760_FIXED_PLL
+   /*
+    * Keep PLL0 and every peripheral/bus clock at their known-good rates.
+    * The generic PLL switch also rewrites the LCD, MSC, memory, and bus
+    * clocks; besides disrupting active devices, its 480 -> 192 MHz order
+    * briefly overclocks those buses. Keep CCLK an integer multiple of the
+    * fixed bus clocks: use CDIV /1, /2, and /4 for boost,
+    * normal, and idle states respectively.
+    */
+   /* The fixed-PLL profiles must correspond to these three divisors. */
+#if CPUFREQ_NORMAL != CPUFREQ_MAX / 2 || CPUFREQ_MIN != CPUFREQ_MAX / 4
+#error "Fixed JZ4760 PLL requires /1, /2, /4 CPU frequency profiles"
+#endif
+   unsigned int cdiv = frequency >= CPUFREQ_MAX ? 0 :
+                       frequency >= CPUFREQ_NORMAL ? 1 : 3;
+   REG_CPM_CPCCR = (REG_CPM_CPCCR & ~CPCCR_CDIV_MASK) |
+       (cdiv << CPCCR_CDIV_LSB) |
+       CPCCR_CE;
+   cpu_frequency = __cpm_get_cclk();
+#else
    pll0_init(frequency);
    cpu_frequency = __cpm_get_pllout2();
+#endif
 }
 #endif

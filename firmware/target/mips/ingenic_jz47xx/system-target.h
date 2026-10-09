@@ -97,7 +97,9 @@ void dma_disable(void);
 #define DMA_USB_CHANNEL    2
 #define DMA_LCD_CHANNEL    3
 #elif CONFIG_CPU == JZ4760B
+#ifndef DMA_AIC_TX_CHANNEL
 #define DMA_AIC_TX_CHANNEL 0
+#endif
 #define DMA_USB_CHANNEL    1
 // Note:  channel 5 and 11 cannot be used!
 #define DMA_SD_RX_CHANNEL0 6
@@ -105,8 +107,12 @@ void dma_disable(void);
 #define DMA_SD_TX_CHANNEL0 8
 #define DMA_SD_TX_CHANNEL1 9
 #define DMA_NAND_CHANNEL   10
+#ifndef DMA_SD_RX_CHANNEL
 #define DMA_SD_RX_CHANNEL(n)  6+n
+#endif
+#ifndef DMA_SD_TX_CHANNEL
 #define DMA_SD_TX_CHANNEL(n)  8+n
+#endif
 #endif
 
 #define XDMA_CALLBACK(n) DMA ## n

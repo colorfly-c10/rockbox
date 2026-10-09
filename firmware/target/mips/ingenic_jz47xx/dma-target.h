@@ -24,6 +24,14 @@
 #include "system.h"
 #include <string.h>
 
+#if CONFIG_CPU == JZ4760B
+/* Eight-word descriptor; callers reserve a cache line and flush before use. */
+struct jz_dma_desc {
+    volatile unsigned int dcmd, dsadr, dtadr, ddadr;
+    volatile unsigned int dstrd, dreqt, reserved0, reserved1;
+};
+#endif
+
 void memset_dma(void *target, int c, size_t len, unsigned int bits);
 void memcpy_dma(void *target, const void *source, size_t len, unsigned int bits);
 

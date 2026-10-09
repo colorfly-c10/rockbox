@@ -1323,6 +1323,7 @@ do {						\
 
 // DMA channel control/status register
 #define DMAC_DCCSR_NDES		(1 << 31) /* descriptor (0) or not (1) ? */
+#define DMAC_DCCSR_INV (1u << 6) /* Invalid descriptor */
 #define DMAC_DCCSR_DES8    	(1 << 30) /* Descriptor 8 Word */
 #define DMAC_DCCSR_DES4    	(0 << 30) /* Descriptor 4 Word */
 #define DMAC_DCCSR_CDOA_BIT	16        /* copy of DMA offset address */
