@@ -1737,6 +1737,8 @@ cat <<EOF
                                                  300) R3 Pro II
  ==Echo project==          ==Surfans==           301) R1
  270) Echo R1 (WIP)        280) F28 (WIP)
+                           ==Colorfly==
+                           255) C10 (WIP)
 
  ==Nintendo==
  290) Nintendo 3DS (WIP)
@@ -3804,6 +3806,28 @@ fi
     t_cpu="mips"
     t_manufacturer="ingenic_jz47xx"
     t_model="xduoo_x3"
+    sysfont="08-Rockfont"
+    ;;
+
+   255|colorflyc10)
+    target_id=125
+    modelname="colorflyc10"
+    target="COLORFLY_C10"
+    memory=128
+    mipselcc
+    tool="$rootdir/tools/scramble -add=c10"
+    bmp2rb_mono="$rootdir/tools/bmp2rb -f 0"
+    bmp2rb_native="$rootdir/tools/bmp2rb -f 4"
+    output="rockbox.c10"
+    appextra="recorder:gui"
+    plugins="yes"
+    toolset=$genericbitmaptools
+    boottool="cp"
+    bootoutput="bootloader-c10.bin"
+    # architecture, manufacturer and model for the target-tree build
+    t_cpu="mips"
+    t_manufacturer="ingenic_jz47xx"
+    t_model="colorfly_c10"
     sysfont="08-Rockfont"
     ;;
 

@@ -599,7 +599,9 @@ drivers/audio/df1704.c
 #elif defined (HAVE_PCM1792_CODEC)
 drivers/audio/pcm1792.c
 #elif defined (HAVE_CS4398)
+#ifndef COLORFLY_C10
 drivers/audio/cs4398.c
+#endif
 #elif defined (HAVE_ES9018)
 drivers/audio/es9018.c
 #elif defined (HAVE_ES9218)
@@ -1736,7 +1738,11 @@ target/mips/ingenic_jz47xx/system-jz4760.c
 target/mips/ingenic_jz47xx/timer-jz4760.c
 #ifndef BOOTLOADER
 target/mips/ingenic_jz47xx/usb-jz4760.c
+#ifdef COLORFLY_C10
+target/mips/ingenic_jz47xx/colorfly_c10/codec-colorfly-c10.c
+#else
 target/mips/ingenic_jz47xx/codec-jz4760.c
+#endif
 target/mips/ingenic_jz47xx/pcm-jz4760.c
 #endif /* BOOTLOADER */
 drivers/nand_id.c
@@ -1802,6 +1808,16 @@ target/mips/ingenic_jz47xx/xduoo_x3/lcd-xduoo_x3.c
 target/mips/ingenic_jz47xx/xduoo_x3/power-xduoo_x3.c
 target/mips/ingenic_jz47xx/xduoo_x3/sadc-xduoo_x3.c
 #endif /* XDUOO_X3 */
+
+#if defined(COLORFLY_C10)
+target/mips/ingenic_jz47xx/colorfly_c10/i2c-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/backlight-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/lcd-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/power-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/sadc-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/sd-colorfly_c10.c
+target/mips/ingenic_jz47xx/colorfly_c10/system-colorfly_c10.c
+#endif /* COLORFLY_C10 */
 
 #if defined(FIIO_M3K)
 target/mips/ingenic_x1000/fiiom3k/audiohw-fiiom3k.c
