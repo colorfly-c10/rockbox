@@ -328,7 +328,11 @@ static const char graphic_numeric[] = "graphic,numeric";
 
 /* Default theme settings */
 #define DEFAULT_WPSNAME  "cabbiev2"
+#ifdef COLORFLY_C10
+#define DEFAULT_SBSNAME  "cabbiev2"
+#else
 #define DEFAULT_SBSNAME  "-"
+#endif
 #define DEFAULT_FMS_NAME "cabbiev2"
 
 #if LCD_HEIGHT <= 64
@@ -347,6 +351,10 @@ static const char graphic_numeric[] = "graphic,numeric";
   #define DEFAULT_FONT_HEIGHT 15
 #elif LCD_HEIGHT <= 320
   #define DEFAULT_FONT_HEIGHT 18
+#elif defined(COLORFLY_C10)
+  /* The 2.35-inch panel needs a larger UI than its pixel dimensions imply. */
+  #define DEFAULT_FONT_HEIGHT 22
+  #define DEFAULT_FONTNAME "22-Terminus"
 #elif defined(SHANLING_Q1)
   /* 16pt font looks pretty aliased & ugly */
   #define DEFAULT_FONT_HEIGHT 18
@@ -369,7 +377,11 @@ static const char graphic_numeric[] = "graphic,numeric";
 #endif
 
 #ifdef HAVE_LCD_COLOR
-  #if DEFAULT_FONT_HEIGHT >= 31 || defined(SHANLING_Q1)
+  #if defined(COLORFLY_C10)
+    /* Match the default font on the 2.35-inch panel. */
+    #define DEFAULT_ICONSET "tango_icons.24x24"
+    #define DEFAULT_VIEWERS_ICONSET "tango_icons_viewers.24x24"
+  #elif DEFAULT_FONT_HEIGHT >= 31 || defined(SHANLING_Q1)
     #define DEFAULT_ICONSET "tango_icons.32x32"
     #define DEFAULT_VIEWERS_ICONSET "tango_icons_viewers.32x32"
   #elif DEFAULT_FONT_HEIGHT >= 23
